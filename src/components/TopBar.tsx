@@ -1,10 +1,13 @@
-import { Download, Loader2 } from 'lucide-react';
+import { Download, Loader2, Menu } from 'lucide-react';
 import { WorkspaceTab } from '../types';
 import { ExportProgress } from '../utils/pdfExport';
 
 interface TopBarProps {
   activeTab: WorkspaceTab;
   onTabChange: (tab: WorkspaceTab) => void;
+  onOpenProjectsDrawer: () => void;
+  isProjectsDrawerOpen: boolean;
+  hasUnsavedChanges: boolean;
   onExportPdf: () => void;
   isExporting: boolean;
   exportProgress: ExportProgress | null;
@@ -20,6 +23,9 @@ const NAV_ITEMS: Array<{ id: WorkspaceTab; label: string }> = [
 export function TopBar({
   activeTab,
   onTabChange,
+  onOpenProjectsDrawer,
+  isProjectsDrawerOpen,
+  hasUnsavedChanges,
   onExportPdf,
   isExporting,
   exportProgress,
@@ -64,8 +70,8 @@ export function TopBar({
         })}
       </nav>
 
-      {/* Zone 3: Single primary action */}
-      <div className="flex items-center shrink-0">
+      {/* Zone 3: Primary action & right-end Projects drawer menu button */}
+      <div className="flex items-center gap-2.5 shrink-0">
         <button
           type="button"
           onClick={onExportPdf}
@@ -78,6 +84,21 @@ export function TopBar({
             <Download className="w-3.5 h-3.5" />
           )}
           <span className="tabular-nums">{exportLabel}</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenProjectsDrawer}
+          aria-label={hasUnsavedChanges ? 'Open projects menu (unsaved edits)' : 'Open projects menu'}
+          aria-expanded={isProjectsDrawerOpen}
+          title={hasUnsavedChanges ? 'Projects (unsaved edits)' : 'Projects'}
+          className={`p-2 rounded-md border transition-colors duration-150 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2563EB] ${
+            isProjectsDrawerOpen
+              ? 'bg-[#F4F4F5] border-[#D4D4D8] text-[#09090B]'
+              : 'bg-white border-[#E4E4E7] text-[#18181B] hover:bg-[#F4F4F5]'
+          }`}
+        >
+          <Menu className="w-4 h-4" />
         </button>
       </div>
     </header>

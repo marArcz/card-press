@@ -163,3 +163,24 @@ export interface CardSizePreset {
   heightMm: number;
   note: string;
 }
+
+export interface FolioPressProjectFile {
+  format: 'foliopress-project';
+  version: 1;
+  projectName: string;
+  savedAt: string;
+  spreadsheet: SpreadsheetData;
+  design: CardDesign;
+  sheetConfig: PrintSheetConfig;
+}
+
+export interface AutoSaveDraft {
+  projectName: string;
+  updatedAt: string;
+  lastExplicitSaveAt: string | null;
+  hasUnsavedChanges: boolean;
+  spreadsheet: SpreadsheetData;
+  design: CardDesign;
+  sheetConfig: PrintSheetConfig;
+}
+

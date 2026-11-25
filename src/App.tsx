@@ -1,8 +1,9 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { CheckCircle2, X } from 'lucide-react';
 import {
   CardDesign,
   CellSelectionConfig,
+  FolioPressProjectFile,
   PrintSheetConfig,
   SpreadsheetData,
   WorkspaceTab,
@@ -14,10 +15,25 @@ import {
 } from './utils/sampleData';
 import { createDefaultSelection, deriveDataFromSelection } from './utils/excel';
 import { ExportProgress, exportRaffleSheetsToPdf } from './utils/pdfExport';
+import {
+  buildProjectFile,
+  LocalFileHandle,
+  saveProjectToDisk,
+} from './utils/projectFile';
+import {
+  clearAutoSaveDraft,
+  loadAutoSaveDraft,
+  loadAutoSavePreference,
+  saveAutoSaveDraft,
+  saveAutoSavePreference,
+} from './utils/autoSave';
 import { TopBar } from './components/TopBar';
 import { DataView } from './components/DataView';
 import { DesignView } from './components/DesignView';
 import { PrintSheetView } from './components/PrintSheetView';
+import { ProjectsDrawer } from './components/ProjectsDrawer';
+
+const DEFAULT_PROJECT_NAME = 'Annual Charity Raffle';
 
 function remapDesignToNewColumns(prev: CardDesign, newColumns: string[]): CardDesign {
   if (newColumns.length === 0) return prev;
@@ -85,6 +101,7 @@ function remapDesignToNewColumns(prev: CardDesign, newColumns: string[]): CardDe
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('design');
+  const [projectName, setProjectName] = useState<string>(DEFAULT_PROJECT_NAME);
   const [spreadsheet, setSpreadsheet] = useState<SpreadsheetData>(() =>
     createInitialSpreadsheet()
   );
@@ -94,9 +111,234 @@ export default function App() {
   );
   const [activeEntryIndex, setActiveEntryIndex] = useState(0);
 
+  // Local project file system & auto-save state
+  const [isProjectsDrawerOpen, setIsProjectsDrawerOpen] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
+  const [activeFileHandle, setActiveFileHandle] = useState<LocalFileHandle | null>(null);
+  const [linkedFileName, setLinkedFileName] = useState<string | null>(null);
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState<boolean>(() =>
+    loadAutoSavePreference()
+  );
+  const [lastAutoSavedAt, setLastAutoSavedAt] = useState<string | null>(null);
+
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  const hydratedRef = useRef(false);
+  const suppressNextDirtyRef = useRef(false);
+  const lastSavedAtRef = useRef<string | null>(null);
+  lastSavedAtRef.current = lastSavedAt;
+
+  // Hydrate working session draft from IndexedDB on initial mount
+  useEffect(() => {
+    let active = true;
+    void loadAutoSaveDraft().then((draft) => {
+      if (!active) return;
+      if (draft && draft.spreadsheet && draft.design && draft.sheetConfig) {
+        suppressNextDirtyRef.current = true;
+        setProjectName(draft.projectName || DEFAULT_PROJECT_NAME);
+        setSpreadsheet(draft.spreadsheet);
+        setDesign(draft.design);
+        setSheetConfig(draft.sheetConfig);
+        setHasUnsavedChanges(Boolean(draft.hasUnsavedChanges));
+        setLastSavedAt(draft.lastExplicitSaveAt ?? null);
+        setLastAutoSavedAt(draft.updatedAt ?? null);
+        setActiveEntryIndex(0);
+      } else {
+        suppressNextDirtyRef.current = false;
+      }
+      hydratedRef.current = true;
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Track edits and debounce auto-save to IndexedDB
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+
+    if (suppressNextDirtyRef.current) {
+      suppressNextDirtyRef.current = false;
+      return;
+    }
+
+    setHasUnsavedChanges(true);
+
+    if (!autoSaveEnabled) return;
+
+    const timer = window.setTimeout(() => {
+      const updatedAt = new Date().toISOString();
+      void saveAutoSaveDraft({
+        projectName,
+        updatedAt,
+        lastExplicitSaveAt: lastSavedAtRef.current,
+        hasUnsavedChanges: true,
+        spreadsheet,
+        design,
+        sheetConfig,
+      }).then(() => {
+        setLastAutoSavedAt(updatedAt);
+      });
+    }, 600);
+
+    return () => window.clearTimeout(timer);
+  }, [projectName, spreadsheet, design, sheetConfig, autoSaveEnabled]);
+
+  // Warn before unloading tab only when auto-save is off and edits are unsaved
+  useEffect(() => {
+    if (!hasUnsavedChanges || autoSaveEnabled) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [hasUnsavedChanges, autoSaveEnabled]);
+
+  const handleSaveProject = useCallback(
+    async (overrideName?: string, forceSaveAs = false): Promise<boolean> => {
+      const targetName = (overrideName ?? projectName).trim() || 'Untitled Raffle Project';
+      const projectFile = buildProjectFile(targetName, spreadsheet, design, sheetConfig);
+      const result = await saveProjectToDisk(projectFile, activeFileHandle, forceSaveAs);
+
+      if (result.cancelled) {
+        return false;
+      }
+
+      const savedIso = projectFile.savedAt;
+      suppressNextDirtyRef.current = true;
+      setProjectName(targetName);
+      setActiveFileHandle(result.handle);
+      setLinkedFileName(result.fileName);
+      setLastSavedAt(savedIso);
+      setHasUnsavedChanges(false);
+
+      if (autoSaveEnabled) {
+        void saveAutoSaveDraft({
+          projectName: targetName,
+          updatedAt: savedIso,
+          lastExplicitSaveAt: savedIso,
+          hasUnsavedChanges: false,
+          spreadsheet,
+          design,
+          sheetConfig,
+        }).then(() => setLastAutoSavedAt(savedIso));
+      }
+
+      setNotice({
+        type: 'success',
+        message:
+          result.method === 'handle'
+            ? `Saved edits directly to ${result.fileName}.`
+            : `Saved ${result.fileName} to your downloads folder.`,
+      });
+      return true;
+    },
+    [projectName, spreadsheet, design, sheetConfig, activeFileHandle, autoSaveEnabled]
+  );
+
+  // Global keyboard shortcuts: Ctrl/Cmd + S (Save) and Ctrl/Cmd + O (Open Projects Drawer)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const key = e.key.toLowerCase();
+      if (key === 's') {
+        e.preventDefault();
+        void handleSaveProject(undefined, e.shiftKey);
+      } else if (key === 'o') {
+        e.preventDefault();
+        setIsProjectsDrawerOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleSaveProject]);
+
+  const handleApplyOpenedProject = useCallback(
+    (project: FolioPressProjectFile, handle: LocalFileHandle | null, fileName: string) => {
+      suppressNextDirtyRef.current = true;
+      setProjectName(project.projectName);
+      setSpreadsheet(project.spreadsheet);
+      setDesign(project.design);
+      setSheetConfig(project.sheetConfig);
+      setActiveEntryIndex(0);
+      setActiveFileHandle(handle);
+      setLinkedFileName(fileName);
+      setLastSavedAt(project.savedAt);
+      setHasUnsavedChanges(false);
+
+      if (autoSaveEnabled) {
+        const now = new Date().toISOString();
+        void saveAutoSaveDraft({
+          projectName: project.projectName,
+          updatedAt: now,
+          lastExplicitSaveAt: project.savedAt,
+          hasUnsavedChanges: false,
+          spreadsheet: project.spreadsheet,
+          design: project.design,
+          sheetConfig: project.sheetConfig,
+        }).then(() => setLastAutoSavedAt(now));
+      }
+
+      setNotice({
+        type: 'success',
+        message: `Opened "${project.projectName}" (${project.spreadsheet.entries.length} cards).`,
+      });
+    },
+    [autoSaveEnabled]
+  );
+
+  const handleCreateNewProject = useCallback(() => {
+    suppressNextDirtyRef.current = true;
+    setProjectName(DEFAULT_PROJECT_NAME);
+    setSpreadsheet(createInitialSpreadsheet());
+    setDesign(createInitialCardDesign());
+    setSheetConfig(createInitialPrintSheetConfig());
+    setActiveEntryIndex(0);
+    setActiveFileHandle(null);
+    setLinkedFileName(null);
+    setLastSavedAt(null);
+    setHasUnsavedChanges(false);
+    setLastAutoSavedAt(null);
+    void clearAutoSaveDraft();
+    setNotice({
+      type: 'success',
+      message: 'Started a fresh starter project.',
+    });
+  }, []);
+
+  const handleToggleAutoSave = useCallback(
+    (enabled: boolean) => {
+      setAutoSaveEnabled(enabled);
+      saveAutoSavePreference(enabled);
+      if (enabled) {
+        const now = new Date().toISOString();
+        void saveAutoSaveDraft({
+          projectName,
+          updatedAt: now,
+          lastExplicitSaveAt: lastSavedAt,
+          hasUnsavedChanges,
+          spreadsheet,
+          design,
+          sheetConfig,
+        }).then(() => setLastAutoSavedAt(now));
+      }
+    },
+    [projectName, lastSavedAt, hasUnsavedChanges, spreadsheet, design, sheetConfig]
+  );
+
+  const handleClearAutoSaveDraft = useCallback(() => {
+    void clearAutoSaveDraft().then(() => {
+      setLastAutoSavedAt(null);
+      setNotice({
+        type: 'success',
+        message: 'Cleared browser recovery draft.',
+      });
+    });
+  }, []);
 
   const applyDerivedUpdate = useCallback(
     (
@@ -120,7 +362,10 @@ export default function App() {
       setSheetConfig((sc) => ({
         ...sc,
         rangeStart: Math.min(sc.rangeStart, Math.max(1, entries.length)),
-        rangeEnd: sc.rangeMode === 'all' ? Math.max(1, entries.length) : Math.min(sc.rangeEnd, Math.max(1, entries.length)),
+        rangeEnd:
+          sc.rangeMode === 'all'
+            ? Math.max(1, entries.length)
+            : Math.min(sc.rangeEnd, Math.max(1, entries.length)),
       }));
 
       return {
@@ -203,7 +448,11 @@ export default function App() {
     setSpreadsheet((prev) => {
       const colCount = Math.max(1, prev.rawRows[0]?.length ?? prev.columns.length ?? 4);
       const newRow = Array.from({ length: colCount }, (_, idx) => {
-        if (idx === 0 && prev.rawRows.length > 0 && /ticket|num|no|id/i.test(prev.rawRows[0][0] ?? '')) {
+        if (
+          idx === 0 &&
+          prev.rawRows.length > 0 &&
+          /ticket|num|no|id/i.test(prev.rawRows[0][0] ?? '')
+        ) {
           return `RF-${String(prev.rawRows.length).padStart(4, '0')}`;
         }
         return '';
@@ -290,7 +539,7 @@ export default function App() {
         design,
         spreadsheet.entries,
         sheetConfig,
-        spreadsheet.fileName,
+        projectName || spreadsheet.fileName,
         (progress) => setExportProgress(progress)
       );
       setNotice({
@@ -306,13 +555,19 @@ export default function App() {
       setIsExporting(false);
       setExportProgress(null);
     }
-  }, [design, spreadsheet.entries, spreadsheet.fileName, sheetConfig]);
+  }, [design, spreadsheet.entries, spreadsheet.fileName, projectName, sheetConfig]);
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[#F8F9FA] text-[#09090B]">
       <TopBar
         activeTab={activeTab}
-        onTabChange={setActiveTab}
+        onTabChange={(tab) => {
+          setIsProjectsDrawerOpen(false);
+          setActiveTab(tab);
+        }}
+        onOpenProjectsDrawer={() => setIsProjectsDrawerOpen(true)}
+        isProjectsDrawerOpen={isProjectsDrawerOpen}
+        hasUnsavedChanges={hasUnsavedChanges}
         onExportPdf={() => void handleExportPdf()}
         isExporting={isExporting}
         exportProgress={exportProgress}
@@ -387,6 +642,26 @@ export default function App() {
           exportProgress={exportProgress}
         />
       )}
+
+      <ProjectsDrawer
+        isOpen={isProjectsDrawerOpen}
+        onClose={() => setIsProjectsDrawerOpen(false)}
+        projectName={projectName}
+        onChangeProjectName={setProjectName}
+        spreadsheet={spreadsheet}
+        design={design}
+        sheetConfig={sheetConfig}
+        hasUnsavedChanges={hasUnsavedChanges}
+        lastSavedAt={lastSavedAt}
+        linkedFileName={linkedFileName}
+        autoSaveEnabled={autoSaveEnabled}
+        lastAutoSavedAt={lastAutoSavedAt}
+        onToggleAutoSave={handleToggleAutoSave}
+        onClearAutoSaveDraft={handleClearAutoSaveDraft}
+        onSaveProject={handleSaveProject}
+        onApplyOpenedProject={handleApplyOpenedProject}
+        onCreateNewProject={handleCreateNewProject}
+      />
     </div>
   );
 }
