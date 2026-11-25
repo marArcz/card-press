@@ -371,14 +371,26 @@ export function DesignView({
         }),
       });
 
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload?.error || 'Reference analysis failed.');
+      const rawBody = await response.text();
+      let payload: { error?: string; summary?: string; design?: Partial<CardDesign> } | null = null;
+      try {
+        payload = rawBody ? JSON.parse(rawBody) : null;
+      } catch {
+        payload = null;
       }
 
-      const extracted = payload.design;
+      if (!response.ok) {
+        const message =
+          payload?.error ||
+          (response.status === 404
+            ? 'The /api/analyze-reference endpoint was not found on this host. Redeploy with API routes enabled and GEMINI_API_KEY configured.'
+            : `Reference analysis failed (HTTP ${response.status}).`);
+        throw new Error(message);
+      }
+
+      const extracted = payload?.design;
       if (!extracted) {
-        throw new Error('No card design data was returned.');
+        throw new Error('No card design data was returned from the analysis endpoint.');
       }
 
       setPreviousSnapshot(design);
@@ -403,7 +415,7 @@ export function DesignView({
             : prev.contentBlocks,
       }));
       setSelectedLayer(null);
-      setAnalysisSummary(payload.summary || 'Card style and layout extracted from reference image.');
+      setAnalysisSummary(payload?.summary || 'Card style and layout extracted from reference image.');
     } catch (err: unknown) {
       setAnalysisError(
         err instanceof Error ? err.message : 'Unable to extract layout from reference image.'
