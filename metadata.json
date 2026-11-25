@@ -1,0 +1,6 @@
+{
+  "name": "FolioPress",
+  "description": "Light minimalist raffle card generator and print studio for Excel rosters, reference-image layouts, and print-ready A4/Letter PDF sheets with crop marks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
