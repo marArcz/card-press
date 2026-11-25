@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChevronLeft,
   ChevronRight,
@@ -7,8 +7,10 @@ import {
   Layers,
   Loader2,
   Plus,
+  Redo2,
   RotateCcw,
   Trash2,
+  Undo2,
   Upload,
   Wand2,
 } from 'lucide-react';
@@ -18,10 +20,11 @@ import {
   CardDesign,
   ContentBlock,
   ContentMode,
+  DesignUpdateOptions,
   EntryRow,
   ImageFit,
   PrintSheetConfig,
-  SelectedLayer,
+  SelectedLayerItem,
 } from '../types';
 import { CARD_SIZE_PRESETS } from '../utils/sampleData';
 import {
@@ -31,7 +34,7 @@ import {
   mmToIn,
 } from '../utils/cardRenderer';
 import { CardPreview } from './CardPreview';
-import { DesignInspector } from './DesignInspector';
+import { DesignInspector, GroupAlignmentAction } from './DesignInspector';
 
 type RailTab = 'format' | 'reference' | 'assets' | 'contents';
 
@@ -41,8 +44,17 @@ interface DesignViewProps {
   columns: string[];
   sheetConfig: PrintSheetConfig;
   activeEntryIndex: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  onBeginDesignTransaction: () => void;
+  onEndDesignTransaction: (didChange: boolean) => void;
   onChangeActiveEntryIndex: (index: number) => void;
-  onUpdateDesign: (updater: (prev: CardDesign) => CardDesign) => void;
+  onUpdateDesign: (
+    updater: (prev: CardDesign) => CardDesign,
+    options?: DesignUpdateOptions
+  ) => void;
   onResetDesign: () => void;
 }
 
@@ -93,17 +105,22 @@ export function DesignView({
   columns,
   sheetConfig,
   activeEntryIndex,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
+  onBeginDesignTransaction,
+  onEndDesignTransaction,
   onChangeActiveEntryIndex,
   onUpdateDesign,
   onResetDesign,
 }: DesignViewProps) {
   const [railTab, setRailTab] = useState<RailTab>('format');
-  const [selectedLayer, setSelectedLayer] = useState<SelectedLayer>(null);
+  const [selectedLayers, setSelectedLayers] = useState<SelectedLayerItem[]>([]);
   const [zoomPct, setZoomPct] = useState<number>(100);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisSummary, setAnalysisSummary] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-  const [previousSnapshot, setPreviousSnapshot] = useState<CardDesign | null>(null);
 
   const refInputRef = useRef<HTMLInputElement>(null);
   const bgInputRef = useRef<HTMLInputElement>(null);
@@ -114,22 +131,234 @@ export function DesignView({
 
   const sheetMetrics = computeSheetMetrics(design, sheetConfig, Math.max(1, entries.length));
 
-  // Scale base display width smoothly to fit drafting area
   const baseCanvasWidthPx = Math.min(580, Math.max(320, design.widthMm * 3.8));
   const renderedWidthPx = Math.round((baseCanvasWidthPx * zoomPct) / 100);
 
-  // Keyboard nudging for selected layer
+  // Prune any selected IDs that no longer exist (e.g. after Undo/Redo)
   useEffect(() => {
-    if (!selectedLayer) return;
+    setSelectedLayers((prev) => {
+      const next = prev.filter((item) =>
+        item.type === 'content'
+          ? design.contentBlocks.some((b) => b.id === item.id)
+          : design.assets.some((a) => a.id === item.id)
+      );
+      return next.length === prev.length ? prev : next;
+    });
+  }, [design.contentBlocks, design.assets]);
+
+  const deleteSelectedLayers = useCallback(() => {
+    if (selectedLayers.length === 0) return;
+    const contentIds = new Set(
+      selectedLayers.filter((l) => l.type === 'content').map((l) => l.id)
+    );
+    const assetIds = new Set(
+      selectedLayers.filter((l) => l.type === 'asset').map((l) => l.id)
+    );
+    onUpdateDesign((prev) => ({
+      ...prev,
+      contentBlocks: prev.contentBlocks.filter((b) => !contentIds.has(b.id)),
+      assets: prev.assets.filter((a) => !assetIds.has(a.id)),
+    }));
+    setSelectedLayers([]);
+  }, [selectedLayers, onUpdateDesign]);
+
+  const duplicateSelectedLayers = useCallback(() => {
+    if (selectedLayers.length === 0) return;
+    const stamp = Date.now();
+    const newSelection: SelectedLayerItem[] = [];
+    const newBlocks: ContentBlock[] = [];
+    const newAssets: AssetLayer[] = [];
+
+    selectedLayers.forEach((item, idx) => {
+      if (item.type === 'content') {
+        const orig = design.contentBlocks.find((b) => b.id === item.id);
+        if (!orig) return;
+        const copyId = `blk-${stamp}-${idx}`;
+        newBlocks.push({
+          ...orig,
+          id: copyId,
+          label: `${orig.label} Copy`,
+          yPct: Math.min(92, orig.yPct + 5),
+        });
+        newSelection.push({ type: 'content', id: copyId });
+      } else {
+        const orig = design.assets.find((a) => a.id === item.id);
+        if (!orig) return;
+        const copyId = `asset-${stamp}-${idx}`;
+        newAssets.push({
+          ...orig,
+          id: copyId,
+          name: `${orig.name} Copy`,
+          xPct: Math.min(92, orig.xPct + 4),
+          yPct: Math.min(92, orig.yPct + 5),
+        });
+        newSelection.push({ type: 'asset', id: copyId });
+      }
+    });
+
+    if (newBlocks.length === 0 && newAssets.length === 0) return;
+
+    onUpdateDesign((prev) => ({
+      ...prev,
+      contentBlocks: [...prev.contentBlocks, ...newBlocks],
+      assets: [...prev.assets, ...newAssets],
+    }));
+    setSelectedLayers(newSelection);
+  }, [selectedLayers, design.contentBlocks, design.assets, onUpdateDesign]);
+
+  const alignSelectedLayers = useCallback(
+    (alignment: GroupAlignmentAction) => {
+      if (selectedLayers.length < 2) return;
+
+      const contentIds = new Set(
+        selectedLayers.filter((l) => l.type === 'content').map((l) => l.id)
+      );
+      const assetIds = new Set(
+        selectedLayers.filter((l) => l.type === 'asset').map((l) => l.id)
+      );
+
+      onUpdateDesign((prev) => {
+        const items: Array<{
+          type: 'content' | 'asset';
+          id: string;
+          x: number;
+          y: number;
+          w: number;
+          h: number;
+        }> = [];
+
+        prev.contentBlocks.forEach((b) => {
+          if (contentIds.has(b.id)) {
+            items.push({ type: 'content', id: b.id, x: b.xPct, y: b.yPct, w: b.widthPct, h: 10 });
+          }
+        });
+        prev.assets.forEach((a) => {
+          if (assetIds.has(a.id)) {
+            items.push({
+              type: 'asset',
+              id: a.id,
+              x: a.xPct,
+              y: a.yPct,
+              w: a.widthPct,
+              h: a.heightPct,
+            });
+          }
+        });
+
+        if (items.length < 2) return prev;
+
+        const minX = Math.min(...items.map((i) => i.x));
+        const maxRight = Math.max(...items.map((i) => i.x + i.w));
+        const centerX = (minX + maxRight) / 2;
+        const minY = Math.min(...items.map((i) => i.y));
+        const maxBottom = Math.max(...items.map((i) => i.y + i.h));
+        const centerY = (minY + maxBottom) / 2;
+
+        const distributedY = new Map<string, number>();
+        if (alignment === 'distribute-v' && items.length >= 3) {
+          const sorted = [...items].sort((a, b) => a.y - b.y);
+          const firstY = sorted[0].y;
+          const lastY = sorted[sorted.length - 1].y;
+          const step = (lastY - firstY) / (sorted.length - 1);
+          sorted.forEach((item, idx) => {
+            distributedY.set(`${item.type}:${item.id}`, Math.round((firstY + idx * step) * 2) / 2);
+          });
+        }
+
+        const applyPos = (
+          type: 'content' | 'asset',
+          id: string,
+          x: number,
+          y: number,
+          w: number,
+          h: number
+        ) => {
+          let nextX = x;
+          let nextY = y;
+          if (alignment === 'left') nextX = minX;
+          if (alignment === 'center-h') nextX = Math.max(0, Math.min(100 - w, centerX - w / 2));
+          if (alignment === 'right') nextX = Math.max(0, maxRight - w);
+          if (alignment === 'top') nextY = minY;
+          if (alignment === 'middle-v') nextY = Math.max(0, Math.min(94, centerY - h / 2));
+          if (alignment === 'bottom') nextY = Math.max(0, Math.min(94, maxBottom - h));
+          if (alignment === 'distribute-v') {
+            nextY = distributedY.get(`${type}:${id}`) ?? y;
+          }
+          return {
+            xPct: Math.round(nextX * 2) / 2,
+            yPct: Math.round(nextY * 2) / 2,
+          };
+        };
+
+        return {
+          ...prev,
+          contentBlocks: prev.contentBlocks.map((b) =>
+            contentIds.has(b.id)
+              ? { ...b, ...applyPos('content', b.id, b.xPct, b.yPct, b.widthPct, 10) }
+              : b
+          ),
+          assets: prev.assets.map((a) =>
+            assetIds.has(a.id)
+              ? { ...a, ...applyPos('asset', a.id, a.xPct, a.yPct, a.widthPct, a.heightPct) }
+              : a
+          ),
+        };
+      });
+    },
+    [selectedLayers, onUpdateDesign]
+  );
+
+  // Keyboard shortcuts: Undo/Redo, Select All, Delete, Escape, and Group Arrow Nudging
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (
+      const isEditingText =
         target &&
         (target.tagName === 'INPUT' ||
           target.tagName === 'TEXTAREA' ||
           target.tagName === 'SELECT' ||
-          target.isContentEditable)
-      ) {
+          target.isContentEditable);
+
+      if (isEditingText) return;
+
+      const mod = e.metaKey || e.ctrlKey;
+      const key = e.key.toLowerCase();
+
+      if (mod && key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) {
+          onRedo();
+        } else {
+          onUndo();
+        }
+        return;
+      }
+
+      if (mod && key === 'y') {
+        e.preventDefault();
+        onRedo();
+        return;
+      }
+
+      if (mod && key === 'a') {
+        e.preventDefault();
+        setSelectedLayers([
+          ...design.contentBlocks.map((b) => ({ type: 'content' as const, id: b.id })),
+          ...design.assets.map((a) => ({ type: 'asset' as const, id: a.id })),
+        ]);
+        return;
+      }
+
+      if (selectedLayers.length === 0) return;
+
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        deleteSelectedLayers();
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        setSelectedLayers([]);
         return;
       }
 
@@ -144,47 +373,98 @@ export function DesignView({
         const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
         const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
 
-        if (selectedLayer.type === 'content') {
-          onUpdateDesign((prev) => ({
+        const contentIds = new Set(
+          selectedLayers.filter((l) => l.type === 'content').map((l) => l.id)
+        );
+        const assetIds = new Set(
+          selectedLayers.filter((l) => l.type === 'asset').map((l) => l.id)
+        );
+
+        onUpdateDesign(
+          (prev) => ({
             ...prev,
             contentBlocks: prev.contentBlocks.map((b) =>
-              b.id === selectedLayer.id
+              contentIds.has(b.id)
                 ? {
                     ...b,
-                    xPct: Math.max(0, Math.min(100 - b.widthPct, b.xPct + dx)),
-                    yPct: Math.max(0, Math.min(95, b.yPct + dy)),
+                    xPct: Math.max(0, Math.min(100 - b.widthPct, Math.round((b.xPct + dx) * 2) / 2)),
+                    yPct: Math.max(0, Math.min(95, Math.round((b.yPct + dy) * 2) / 2)),
                   }
                 : b
             ),
-          }));
-        } else {
-          onUpdateDesign((prev) => ({
-            ...prev,
             assets: prev.assets.map((a) =>
-              a.id === selectedLayer.id
+              assetIds.has(a.id)
                 ? {
                     ...a,
-                    xPct: Math.max(0, Math.min(100 - a.widthPct, a.xPct + dx)),
-                    yPct: Math.max(0, Math.min(100 - a.heightPct, a.yPct + dy)),
+                    xPct: Math.max(0, Math.min(100 - a.widthPct, Math.round((a.xPct + dx) * 2) / 2)),
+                    yPct: Math.max(0, Math.min(100 - a.heightPct, Math.round((a.yPct + dy) * 2) / 2)),
                   }
                 : a
             ),
-          }));
-        }
-      } else if (e.key === 'Escape') {
-        setSelectedLayer(null);
+          }),
+          { coalesceKey: 'nudge' }
+        );
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedLayer, onUpdateDesign]);
+  }, [
+    selectedLayers,
+    design.contentBlocks,
+    design.assets,
+    onUpdateDesign,
+    onUndo,
+    onRedo,
+    deleteSelectedLayers,
+  ]);
 
-  const updateContentBlock = (id: string, patch: Partial<ContentBlock>) => {
-    onUpdateDesign((prev) => ({
-      ...prev,
-      contentBlocks: prev.contentBlocks.map((b) => (b.id === id ? { ...b, ...patch } : b)),
-    }));
+  const toggleSelectFromRail = (
+    e: React.MouseEvent,
+    type: 'content' | 'asset',
+    id: string
+  ) => {
+    const isAdditive = e.shiftKey || e.metaKey || e.ctrlKey;
+    if (!isAdditive) {
+      setSelectedLayers([{ type, id }]);
+      return;
+    }
+    setSelectedLayers((prev) => {
+      const exists = prev.some((l) => l.type === type && l.id === id);
+      if (exists) {
+        return prev.filter((l) => !(l.type === type && l.id === id));
+      }
+      return [...prev, { type, id }];
+    });
+  };
+
+  const updateContentBlock = (
+    id: string,
+    patch: Partial<ContentBlock>,
+    options?: DesignUpdateOptions
+  ) => {
+    onUpdateDesign(
+      (prev) => ({
+        ...prev,
+        contentBlocks: prev.contentBlocks.map((b) => (b.id === id ? { ...b, ...patch } : b)),
+      }),
+      options
+    );
+  };
+
+  const batchUpdateContentBlocks = (
+    ids: string[],
+    patch: Partial<ContentBlock>,
+    options?: DesignUpdateOptions
+  ) => {
+    const idSet = new Set(ids);
+    onUpdateDesign(
+      (prev) => ({
+        ...prev,
+        contentBlocks: prev.contentBlocks.map((b) => (idSet.has(b.id) ? { ...b, ...patch } : b)),
+      }),
+      options
+    );
   };
 
   const addContentBlock = (mode: ContentMode) => {
@@ -222,7 +502,7 @@ export function DesignView({
       ...prev,
       contentBlocks: [...prev.contentBlocks, newBlock],
     }));
-    setSelectedLayer({ type: 'content', id });
+    setSelectedLayers([{ type: 'content', id }]);
     setRailTab('contents');
   };
 
@@ -240,7 +520,7 @@ export function DesignView({
       ...prev,
       contentBlocks: [...prev.contentBlocks, copy],
     }));
-    setSelectedLayer({ type: 'content', id: copyId });
+    setSelectedLayers([{ type: 'content', id: copyId }]);
   };
 
   const deleteContentBlock = (id: string) => {
@@ -248,16 +528,21 @@ export function DesignView({
       ...prev,
       contentBlocks: prev.contentBlocks.filter((b) => b.id !== id),
     }));
-    if (selectedLayer?.type === 'content' && selectedLayer.id === id) {
-      setSelectedLayer(null);
-    }
+    setSelectedLayers((prev) => prev.filter((l) => !(l.type === 'content' && l.id === id)));
   };
 
-  const updateAssetLayer = (id: string, patch: Partial<AssetLayer>) => {
-    onUpdateDesign((prev) => ({
-      ...prev,
-      assets: prev.assets.map((a) => (a.id === id ? { ...a, ...patch } : a)),
-    }));
+  const updateAssetLayer = (
+    id: string,
+    patch: Partial<AssetLayer>,
+    options?: DesignUpdateOptions
+  ) => {
+    onUpdateDesign(
+      (prev) => ({
+        ...prev,
+        assets: prev.assets.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+      }),
+      options
+    );
   };
 
   const moveAssetLayer = (id: string, direction: 'up' | 'down') => {
@@ -278,9 +563,7 @@ export function DesignView({
       ...prev,
       assets: prev.assets.filter((a) => a.id !== id),
     }));
-    if (selectedLayer?.type === 'asset' && selectedLayer.id === id) {
-      setSelectedLayer(null);
-    }
+    setSelectedLayers((prev) => prev.filter((l) => !(l.type === 'asset' && l.id === id)));
   };
 
   const handleReferenceUpload = async (file: File | undefined) => {
@@ -347,8 +630,8 @@ export function DesignView({
       ...prev,
       assets: [...prev.assets, ...newLayers],
     }));
-    if (newLayers[0]) {
-      setSelectedLayer({ type: 'asset', id: newLayers[0].id });
+    if (newLayers.length > 0) {
+      setSelectedLayers(newLayers.map((a) => ({ type: 'asset' as const, id: a.id })));
     }
     if (assetInputRef.current) assetInputRef.current.value = '';
   };
@@ -393,7 +676,6 @@ export function DesignView({
         throw new Error('No card design data was returned from the analysis endpoint.');
       }
 
-      setPreviousSnapshot(design);
       onUpdateDesign((prev) => ({
         ...prev,
         widthMm: extracted.widthMm ?? prev.widthMm,
@@ -414,7 +696,7 @@ export function DesignView({
             ? extracted.contentBlocks
             : prev.contentBlocks,
       }));
-      setSelectedLayer(null);
+      setSelectedLayers([]);
       setAnalysisSummary(payload?.summary || 'Card style and layout extracted from reference image.');
     } catch (err: unknown) {
       setAnalysisError(
@@ -531,7 +813,7 @@ export function DesignView({
                       <button
                         key={unit}
                         type="button"
-                        onClick={() => onUpdateDesign((prev) => ({ ...prev, unit }))}
+                        onClick={() => onUpdateDesign((prev) => ({ ...prev, unit }), { skipHistory: true })}
                         className={`px-2 py-0.5 text-[10px] font-mono-tabular font-medium rounded transition-colors ${
                           design.unit === unit
                             ? 'bg-white text-[#09090B] shadow-xs'
@@ -587,10 +869,13 @@ export function DesignView({
                       step={design.unit === 'in' ? 0.1 : 1}
                       value={displayDimValue(design.widthMm)}
                       onChange={(e) =>
-                        onUpdateDesign((prev) => ({
-                          ...prev,
-                          widthMm: parseDimInput(e.target.value, 35, 250),
-                        }))
+                        onUpdateDesign(
+                          (prev) => ({
+                            ...prev,
+                            widthMm: parseDimInput(e.target.value, 35, 250),
+                          }),
+                          { coalesceKey: 'dim-w' }
+                        )
                       }
                       className="w-full px-2.5 py-1.5 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
                     />
@@ -604,10 +889,13 @@ export function DesignView({
                       step={design.unit === 'in' ? 0.1 : 1}
                       value={displayDimValue(design.heightMm)}
                       onChange={(e) =>
-                        onUpdateDesign((prev) => ({
-                          ...prev,
-                          heightMm: parseDimInput(e.target.value, 25, 200),
-                        }))
+                        onUpdateDesign(
+                          (prev) => ({
+                            ...prev,
+                            heightMm: parseDimInput(e.target.value, 25, 200),
+                          }),
+                          { coalesceKey: 'dim-h' }
+                        )
                       }
                       className="w-full px-2.5 py-1.5 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
                     />
@@ -642,7 +930,10 @@ export function DesignView({
                       type="color"
                       value={design.backgroundColor}
                       onChange={(e) =>
-                        onUpdateDesign((prev) => ({ ...prev, backgroundColor: e.target.value }))
+                        onUpdateDesign(
+                          (prev) => ({ ...prev, backgroundColor: e.target.value }),
+                          { coalesceKey: 'bg-color' }
+                        )
                       }
                       className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                     />
@@ -650,7 +941,10 @@ export function DesignView({
                       type="text"
                       value={design.backgroundColor}
                       onChange={(e) =>
-                        onUpdateDesign((prev) => ({ ...prev, backgroundColor: e.target.value }))
+                        onUpdateDesign(
+                          (prev) => ({ ...prev, backgroundColor: e.target.value }),
+                          { coalesceKey: 'bg-color' }
+                        )
                       }
                       className="w-full text-[11px] font-mono-tabular bg-transparent focus:outline-none"
                     />
@@ -723,7 +1017,10 @@ export function DesignView({
                           type="color"
                           value={design.borderColor}
                           onChange={(e) =>
-                            onUpdateDesign((prev) => ({ ...prev, borderColor: e.target.value }))
+                            onUpdateDesign(
+                              (prev) => ({ ...prev, borderColor: e.target.value }),
+                              { coalesceKey: 'border-color' }
+                            )
                           }
                           className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                         />
@@ -743,10 +1040,13 @@ export function DesignView({
                         step={0.5}
                         value={design.borderInsetMm}
                         onChange={(e) =>
-                          onUpdateDesign((prev) => ({
-                            ...prev,
-                            borderInsetMm: Number(e.target.value),
-                          }))
+                          onUpdateDesign(
+                            (prev) => ({
+                              ...prev,
+                              borderInsetMm: Number(e.target.value),
+                            }),
+                            { coalesceKey: 'border-inset' }
+                          )
                         }
                         className="w-full mt-2 accent-[#18181B]"
                       />
@@ -765,10 +1065,13 @@ export function DesignView({
                     step={0.5}
                     value={design.cornerRadiusMm}
                     onChange={(e) =>
-                      onUpdateDesign((prev) => ({
-                        ...prev,
-                        cornerRadiusMm: Number(e.target.value),
-                      }))
+                      onUpdateDesign(
+                        (prev) => ({
+                          ...prev,
+                          cornerRadiusMm: Number(e.target.value),
+                        }),
+                        { coalesceKey: 'corner-radius' }
+                      )
                     }
                     className="w-full accent-[#18181B]"
                   />
@@ -810,10 +1113,13 @@ export function DesignView({
                         step={1}
                         value={design.dividerPositionPct}
                         onChange={(e) =>
-                          onUpdateDesign((prev) => ({
-                            ...prev,
-                            dividerPositionPct: Number(e.target.value),
-                          }))
+                          onUpdateDesign(
+                            (prev) => ({
+                              ...prev,
+                              dividerPositionPct: Number(e.target.value),
+                            }),
+                            { coalesceKey: 'divider-pos' }
+                          )
                         }
                         className="w-full accent-[#18181B]"
                       />
@@ -837,7 +1143,10 @@ export function DesignView({
                           type="color"
                           value={design.dividerColor}
                           onChange={(e) =>
-                            onUpdateDesign((prev) => ({ ...prev, dividerColor: e.target.value }))
+                            onUpdateDesign(
+                              (prev) => ({ ...prev, dividerColor: e.target.value }),
+                              { coalesceKey: 'divider-color' }
+                            )
                           }
                           className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                         />
@@ -947,14 +1256,12 @@ export function DesignView({
                     {analysisSummary && (
                       <div className="p-2.5 rounded-md bg-[#F4F4F5] text-[11px] text-[#18181B] space-y-2">
                         <p>{analysisSummary}</p>
-                        {previousSnapshot && (
+                        {canUndo && (
                           <button
                             type="button"
                             onClick={() => {
-                              const restore = previousSnapshot;
-                              setPreviousSnapshot(null);
+                              onUndo();
                               setAnalysisSummary(null);
-                              onUpdateDesign(() => restore);
                             }}
                             className="inline-flex items-center gap-1 font-medium text-[#2563EB] hover:underline"
                           >
@@ -1002,13 +1309,16 @@ export function DesignView({
                           type="checkbox"
                           checked={design.referenceImage.showGhostOverlay}
                           onChange={(e) =>
-                            onUpdateDesign((prev) => ({
-                              ...prev,
-                              referenceImage: {
-                                ...prev.referenceImage,
-                                showGhostOverlay: e.target.checked,
-                              },
-                            }))
+                            onUpdateDesign(
+                              (prev) => ({
+                                ...prev,
+                                referenceImage: {
+                                  ...prev.referenceImage,
+                                  showGhostOverlay: e.target.checked,
+                                },
+                              }),
+                              { skipHistory: true }
+                            )
                           }
                           className="mt-0.5 accent-[#18181B]"
                         />
@@ -1032,13 +1342,16 @@ export function DesignView({
                             step={0.05}
                             value={design.referenceImage.ghostOpacity}
                             onChange={(e) =>
-                              onUpdateDesign((prev) => ({
-                                ...prev,
-                                referenceImage: {
-                                  ...prev.referenceImage,
-                                  ghostOpacity: Number(e.target.value),
-                                },
-                              }))
+                              onUpdateDesign(
+                                (prev) => ({
+                                  ...prev,
+                                  referenceImage: {
+                                    ...prev.referenceImage,
+                                    ghostOpacity: Number(e.target.value),
+                                  },
+                                }),
+                                { skipHistory: true }
+                              )
                             }
                             className="w-full accent-[#18181B]"
                           />
@@ -1145,13 +1458,16 @@ export function DesignView({
                             step={0.05}
                             value={design.backgroundImage.opacity}
                             onChange={(e) =>
-                              onUpdateDesign((prev) => ({
-                                ...prev,
-                                backgroundImage: {
-                                  ...prev.backgroundImage,
-                                  opacity: Number(e.target.value),
-                                },
-                              }))
+                              onUpdateDesign(
+                                (prev) => ({
+                                  ...prev,
+                                  backgroundImage: {
+                                    ...prev.backgroundImage,
+                                    opacity: Number(e.target.value),
+                                  },
+                                }),
+                                { coalesceKey: 'bg-op' }
+                              )
                             }
                             className="w-full accent-[#18181B]"
                           />
@@ -1167,13 +1483,16 @@ export function DesignView({
                                 type="color"
                                 value={design.backgroundImage.overlayColor}
                                 onChange={(e) =>
-                                  onUpdateDesign((prev) => ({
-                                    ...prev,
-                                    backgroundImage: {
-                                      ...prev.backgroundImage,
-                                      overlayColor: e.target.value,
-                                    },
-                                  }))
+                                  onUpdateDesign(
+                                    (prev) => ({
+                                      ...prev,
+                                      backgroundImage: {
+                                        ...prev.backgroundImage,
+                                        overlayColor: e.target.value,
+                                      },
+                                    }),
+                                    { coalesceKey: 'tint-color' }
+                                  )
                                 }
                                 className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                               />
@@ -1193,13 +1512,16 @@ export function DesignView({
                               step={0.05}
                               value={design.backgroundImage.overlayOpacity}
                               onChange={(e) =>
-                                onUpdateDesign((prev) => ({
-                                  ...prev,
-                                  backgroundImage: {
-                                    ...prev.backgroundImage,
-                                    overlayOpacity: Number(e.target.value),
-                                  },
-                                }))
+                                onUpdateDesign(
+                                  (prev) => ({
+                                    ...prev,
+                                    backgroundImage: {
+                                      ...prev.backgroundImage,
+                                      overlayOpacity: Number(e.target.value),
+                                    },
+                                  }),
+                                  { coalesceKey: 'tint-op' }
+                                )
                               }
                               className="w-full accent-[#18181B]"
                             />
@@ -1233,7 +1555,7 @@ export function DesignView({
               <div>
                 <h2 className="text-xs font-semibold text-[#09090B]">Design Assets</h2>
                 <p className="text-[11px] text-[#71717A] mt-0.5">
-                  Upload logos, sponsor marks, emblems, or graphics and position them anywhere on the card.
+                  Upload logos or graphics. Shift+click items to multi-select.
                 </p>
               </div>
 
@@ -1254,12 +1576,13 @@ export function DesignView({
               ) : (
                 <div className="space-y-1.5">
                   {design.assets.map((asset) => {
-                    const isSelected =
-                      selectedLayer?.type === 'asset' && selectedLayer.id === asset.id;
+                    const isSelected = selectedLayers.some(
+                      (l) => l.type === 'asset' && l.id === asset.id
+                    );
                     return (
                       <div
                         key={asset.id}
-                        onClick={() => setSelectedLayer({ type: 'asset', id: asset.id })}
+                        onClick={(e) => toggleSelectFromRail(e, 'asset', asset.id)}
                         className={`flex items-center justify-between gap-2.5 px-2.5 py-2 rounded-md border cursor-pointer transition-colors ${
                           isSelected
                             ? 'border-[#2563EB] bg-[#EFF6FF]/40'
@@ -1304,7 +1627,10 @@ export function DesignView({
           {railTab === 'contents' && (
             <div className="space-y-4">
               <div className="space-y-2">
-                <h2 className="text-xs font-semibold text-[#09090B]">Card Content Fields</h2>
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-semibold text-[#09090B]">Card Content Fields</h2>
+                  <span className="text-[10px] text-[#71717A]">Shift+click to multi-select</span>
+                </div>
                 <div className="grid grid-cols-2 gap-1.5">
                   <button
                     type="button"
@@ -1327,8 +1653,9 @@ export function DesignView({
 
               <div className="space-y-1.5">
                 {design.contentBlocks.map((block) => {
-                  const isSelected =
-                    selectedLayer?.type === 'content' && selectedLayer.id === block.id;
+                  const isSelected = selectedLayers.some(
+                    (l) => l.type === 'content' && l.id === block.id
+                  );
                   const sourceMeta =
                     block.mode === 'column'
                       ? block.columnKey === '__ROW_NUMBER__'
@@ -1341,7 +1668,7 @@ export function DesignView({
                   return (
                     <div
                       key={block.id}
-                      onClick={() => setSelectedLayer({ type: 'content', id: block.id })}
+                      onClick={(e) => toggleSelectFromRail(e, 'content', block.id)}
                       className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-md border cursor-pointer transition-colors ${
                         isSelected
                           ? 'border-[#2563EB] bg-[#EFF6FF]/40'
@@ -1393,8 +1720,8 @@ export function DesignView({
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Canvas Toolbar */}
         <div className="h-11 shrink-0 px-5 bg-white/80 backdrop-blur-xs border-b border-[#E4E4E7] flex items-center justify-between gap-4">
-          {/* Entry Stepper */}
-          <div className="flex items-center gap-2 min-w-0">
+          {/* Left: Entry Stepper + Undo/Redo + Dimensions */}
+          <div className="flex items-center gap-3 min-w-0">
             <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white">
               <button
                 type="button"
@@ -1421,7 +1748,31 @@ export function DesignView({
               </button>
             </div>
 
-            <div className="hidden lg:flex items-center gap-2 text-[11px] text-[#71717A] font-mono-tabular truncate">
+            {/* Undo / Redo Controls */}
+            <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white divide-x divide-[#E4E4E7]">
+              <button
+                type="button"
+                onClick={onUndo}
+                disabled={!canUndo}
+                title="Undo (Ctrl+Z)"
+                aria-label="Undo"
+                className="px-2 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 disabled:hover:bg-transparent transition-colors rounded-l-md"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={onRedo}
+                disabled={!canRedo}
+                title="Redo (Ctrl+Y / Ctrl+Shift+Z)"
+                aria-label="Redo"
+                className="px-2 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 disabled:hover:bg-transparent transition-colors rounded-r-md"
+              >
+                <Redo2 className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="hidden xl:flex items-center gap-2 text-[11px] text-[#71717A] font-mono-tabular truncate">
               <span>
                 {formatDimension(design.widthMm, design.unit)} ×{' '}
                 {formatDimension(design.heightMm, design.unit)}
@@ -1456,7 +1807,7 @@ export function DesignView({
 
         {/* Drafting Field */}
         <div
-          onClick={() => setSelectedLayer(null)}
+          onClick={() => setSelectedLayers([])}
           style={{
             backgroundImage: 'radial-gradient(#D4D4D8 1px, transparent 1px)',
             backgroundSize: '20px 20px',
@@ -1470,16 +1821,19 @@ export function DesignView({
               rowIndex={safeEntryIndex}
               widthPx={renderedWidthPx}
               interactive
-              selectedLayer={selectedLayer}
-              onSelectLayer={setSelectedLayer}
+              selectedLayers={selectedLayers}
+              onSelectLayers={setSelectedLayers}
+              onUpdateDesign={onUpdateDesign}
               onUpdateContentBlock={updateContentBlock}
               onUpdateAssetLayer={updateAssetLayer}
+              onBeginDragTransaction={onBeginDesignTransaction}
+              onEndDragTransaction={onEndDesignTransaction}
               showReferenceGhost
             />
           </div>
 
           <p className="mt-6 text-[11px] text-[#71717A] text-center">
-            Click any content block or asset to edit · Drag to reposition · Use arrow keys to nudge
+            Drag empty space or Shift+click to select multiple · Drag or use arrow keys to move · Ctrl+Z / Ctrl+Y to undo &amp; redo
           </p>
         </div>
       </main>
@@ -1490,8 +1844,13 @@ export function DesignView({
         columns={columns}
         activeEntry={activeEntry}
         activeEntryIndex={safeEntryIndex}
-        selectedLayer={selectedLayer}
+        selectedLayers={selectedLayers}
+        onSelectLayers={setSelectedLayers}
         onUpdateContentBlock={updateContentBlock}
+        onBatchUpdateContentBlocks={batchUpdateContentBlocks}
+        onAlignSelectedLayers={alignSelectedLayers}
+        onDuplicateSelectedLayers={duplicateSelectedLayers}
+        onDeleteSelectedLayers={deleteSelectedLayers}
         onDuplicateContentBlock={duplicateContentBlock}
         onDeleteContentBlock={deleteContentBlock}
         onUpdateAssetLayer={updateAssetLayer}

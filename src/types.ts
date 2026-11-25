@@ -151,10 +151,16 @@ export interface SheetLayoutMetrics {
   fitsOnPage: boolean;
 }
 
-export type SelectedLayer =
+export type SelectedLayerItem =
   | { type: 'content'; id: string }
-  | { type: 'asset'; id: string }
-  | null;
+  | { type: 'asset'; id: string };
+
+export type SelectedLayer = SelectedLayerItem | null;
+
+export interface DesignUpdateOptions {
+  skipHistory?: boolean;
+  coalesceKey?: string;
+}
 
 export interface CardSizePreset {
   id: string;

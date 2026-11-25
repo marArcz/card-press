@@ -1,13 +1,21 @@
 import {
   AlignCenter,
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
   AlignLeft,
   AlignRight,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  AlignVerticalSpaceAround,
   ArrowDown,
   ArrowUp,
   Copy,
   ImagePlus,
   Plus,
   Trash2,
+  X,
 } from 'lucide-react';
 import {
   AssetLayer,
@@ -15,22 +23,49 @@ import {
   CardFontFamily,
   ContentBlock,
   ContentMode,
+  DesignUpdateOptions,
   EntryRow,
-  SelectedLayer,
+  SelectedLayerItem,
 } from '../types';
 import { CARD_FONT_OPTIONS } from '../utils/sampleData';
 import { formatDimension, resolveBlockText } from '../utils/cardRenderer';
+
+export type GroupAlignmentAction =
+  | 'left'
+  | 'center-h'
+  | 'right'
+  | 'top'
+  | 'middle-v'
+  | 'bottom'
+  | 'distribute-v';
 
 interface DesignInspectorProps {
   design: CardDesign;
   columns: string[];
   activeEntry: EntryRow | undefined;
   activeEntryIndex: number;
-  selectedLayer: SelectedLayer;
-  onUpdateContentBlock: (id: string, patch: Partial<ContentBlock>) => void;
+  selectedLayers: SelectedLayerItem[];
+  onSelectLayers: (layers: SelectedLayerItem[]) => void;
+  onUpdateContentBlock: (
+    id: string,
+    patch: Partial<ContentBlock>,
+    options?: DesignUpdateOptions
+  ) => void;
+  onBatchUpdateContentBlocks: (
+    ids: string[],
+    patch: Partial<ContentBlock>,
+    options?: DesignUpdateOptions
+  ) => void;
+  onAlignSelectedLayers: (alignment: GroupAlignmentAction) => void;
+  onDuplicateSelectedLayers: () => void;
+  onDeleteSelectedLayers: () => void;
   onDuplicateContentBlock: (id: string) => void;
   onDeleteContentBlock: (id: string) => void;
-  onUpdateAssetLayer: (id: string, patch: Partial<AssetLayer>) => void;
+  onUpdateAssetLayer: (
+    id: string,
+    patch: Partial<AssetLayer>,
+    options?: DesignUpdateOptions
+  ) => void;
   onMoveAssetLayer: (id: string, direction: 'up' | 'down') => void;
   onDeleteAssetLayer: (id: string) => void;
   onAddContentBlock: (mode: ContentMode) => void;
@@ -42,8 +77,13 @@ export function DesignInspector({
   columns,
   activeEntry,
   activeEntryIndex,
-  selectedLayer,
+  selectedLayers,
+  onSelectLayers,
   onUpdateContentBlock,
+  onBatchUpdateContentBlocks,
+  onAlignSelectedLayers,
+  onDuplicateSelectedLayers,
+  onDeleteSelectedLayers,
   onDuplicateContentBlock,
   onDeleteContentBlock,
   onUpdateAssetLayer,
@@ -52,14 +92,336 @@ export function DesignInspector({
   onAddContentBlock,
   onOpenAssetsTab,
 }: DesignInspectorProps) {
+  // Multi-selection inspector
+  if (selectedLayers.length > 1) {
+    const selectedContentBlocks = design.contentBlocks.filter((b) =>
+      selectedLayers.some((l) => l.type === 'content' && l.id === b.id)
+    );
+    const selectedAssets = design.assets.filter((a) =>
+      selectedLayers.some((l) => l.type === 'asset' && l.id === a.id)
+    );
+    const selectedContentIds = selectedContentBlocks.map((b) => b.id);
+
+    const commonFont =
+      selectedContentBlocks.length > 0 &&
+      selectedContentBlocks.every((b) => b.fontFamily === selectedContentBlocks[0].fontFamily)
+        ? selectedContentBlocks[0].fontFamily
+        : '';
+    const commonWeight =
+      selectedContentBlocks.length > 0 &&
+      selectedContentBlocks.every((b) => b.fontWeight === selectedContentBlocks[0].fontWeight)
+        ? String(selectedContentBlocks[0].fontWeight)
+        : '';
+    const commonSize =
+      selectedContentBlocks.length > 0 &&
+      selectedContentBlocks.every((b) => b.fontSizePt === selectedContentBlocks[0].fontSizePt)
+        ? String(selectedContentBlocks[0].fontSizePt)
+        : '';
+    const commonColor =
+      selectedContentBlocks.length > 0 &&
+      selectedContentBlocks.every((b) => b.color === selectedContentBlocks[0].color)
+        ? selectedContentBlocks[0].color
+        : '#09090B';
+    const commonAlign =
+      selectedContentBlocks.length > 0 &&
+      selectedContentBlocks.every((b) => b.align === selectedContentBlocks[0].align)
+        ? selectedContentBlocks[0].align
+        : null;
+    const allUppercase =
+      selectedContentBlocks.length > 0 && selectedContentBlocks.every((b) => b.uppercase);
+
+    const summaryParts: string[] = [];
+    if (selectedContentBlocks.length > 0) {
+      summaryParts.push(`${selectedContentBlocks.length} text`);
+    }
+    if (selectedAssets.length > 0) {
+      summaryParts.push(`${selectedAssets.length} asset${selectedAssets.length > 1 ? 's' : ''}`);
+    }
+
+    return (
+      <aside className="w-[300px] shrink-0 bg-white border-l border-[#E4E4E7] flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-[#E4E4E7] flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <h2 className="text-xs font-semibold text-[#09090B] tabular-nums">
+              {selectedLayers.length} Elements Selected
+            </h2>
+            <p className="text-[11px] text-[#71717A] truncate">
+              {summaryParts.join(' · ')}
+            </p>
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={onDuplicateSelectedLayers}
+              title="Duplicate selected elements"
+              aria-label="Duplicate selected elements"
+              className="p-1.5 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] rounded"
+            >
+              <Copy className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={onDeleteSelectedLayers}
+              title="Delete selected elements"
+              aria-label="Delete selected elements"
+              className="p-1.5 text-[#52525B] hover:text-[#DC2626] hover:bg-[#FEF2F2] rounded"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-5">
+          {/* Align & Distribute */}
+          <div className="space-y-2.5">
+            <h3 className="text-[11px] font-semibold text-[#09090B]">Align Selection</h3>
+            <div className="grid grid-cols-6 gap-1 p-1 bg-[#F4F4F5] rounded-md">
+              {(
+                [
+                  { id: 'left', label: 'Align left edges', Icon: AlignStartVertical },
+                  { id: 'center-h', label: 'Align horizontal centers', Icon: AlignCenterVertical },
+                  { id: 'right', label: 'Align right edges', Icon: AlignEndVertical },
+                  { id: 'top', label: 'Align top edges', Icon: AlignStartHorizontal },
+                  { id: 'middle-v', label: 'Align vertical centers', Icon: AlignCenterHorizontal },
+                  { id: 'bottom', label: 'Align bottom edges', Icon: AlignEndHorizontal },
+                ] as const
+              ).map(({ id, label, Icon }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => onAlignSelectedLayers(id)}
+                  title={label}
+                  aria-label={label}
+                  className="py-1.5 flex items-center justify-center rounded text-[#52525B] hover:bg-white hover:text-[#09090B] hover:shadow-xs transition-colors"
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                </button>
+              ))}
+            </div>
+
+            {selectedLayers.length >= 3 && (
+              <button
+                type="button"
+                onClick={() => onAlignSelectedLayers('distribute-v')}
+                className="w-full py-1.5 px-2.5 text-[11px] font-medium text-[#18181B] bg-[#FAFAFA] hover:bg-[#F4F4F5] border border-[#E4E4E7] rounded-md inline-flex items-center justify-center gap-1.5 transition-colors"
+              >
+                <AlignVerticalSpaceAround className="w-3.5 h-3.5 text-[#52525B]" />
+                Distribute Vertically
+              </button>
+            )}
+          </div>
+
+          {/* Batch Typography (when text blocks are part of selection) */}
+          {selectedContentBlocks.length > 0 && (
+            <>
+              <hr className="border-[#F4F4F5]" />
+              <div className="space-y-3">
+                <h3 className="text-[11px] font-semibold text-[#09090B]">
+                  Batch Typography ({selectedContentBlocks.length})
+                </h3>
+
+                <div>
+                  <label className="block text-[11px] text-[#71717A] mb-1">Font Family</label>
+                  <select
+                    value={commonFont}
+                    onChange={(e) => {
+                      if (!e.target.value) return;
+                      onBatchUpdateContentBlocks(selectedContentIds, {
+                        fontFamily: e.target.value as CardFontFamily,
+                      });
+                    }}
+                    className="w-full px-2.5 py-1.5 text-xs bg-white border border-[#E4E4E7] rounded-md text-[#09090B] focus:outline-none focus:border-[#2563EB]"
+                  >
+                    {!commonFont && <option value="">Mixed fonts</option>}
+                    {CARD_FONT_OPTIONS.map((font) => (
+                      <option key={font.value} value={font.value}>
+                        {font.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-[#71717A] mb-1">Size (pt)</label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={64}
+                      step={0.5}
+                      placeholder="Mixed"
+                      value={commonSize}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (!Number.isNaN(val) && val >= 5) {
+                          onBatchUpdateContentBlocks(
+                            selectedContentIds,
+                            { fontSizePt: Math.min(64, val) },
+                            { coalesceKey: 'batch-size' }
+                          );
+                        }
+                      }}
+                      className="w-full px-2.5 py-1.5 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-[#71717A] mb-1">Weight</label>
+                    <select
+                      value={commonWeight}
+                      onChange={(e) => {
+                        if (!e.target.value) return;
+                        onBatchUpdateContentBlocks(selectedContentIds, {
+                          fontWeight: Number(e.target.value) as ContentBlock['fontWeight'],
+                        });
+                      }}
+                      className="w-full px-2.5 py-1.5 text-xs bg-white border border-[#E4E4E7] rounded-md text-[#09090B] focus:outline-none focus:border-[#2563EB]"
+                    >
+                      {!commonWeight && <option value="">Mixed</option>}
+                      <option value="400">Regular (400)</option>
+                      <option value="500">Medium (500)</option>
+                      <option value="600">SemiBold (600)</option>
+                      <option value="700">Bold (700)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2.5 items-end">
+                  <div>
+                    <label className="block text-[11px] text-[#71717A] mb-1">Text Color</label>
+                    <div className="flex items-center gap-1.5 border border-[#E4E4E7] rounded-md px-2 py-1 bg-[#FAFAFA]">
+                      <input
+                        type="color"
+                        value={commonColor}
+                        onChange={(e) =>
+                          onBatchUpdateContentBlocks(
+                            selectedContentIds,
+                            { color: e.target.value },
+                            { coalesceKey: 'batch-color' }
+                          )
+                        }
+                        className="w-5 h-5 rounded border-0 bg-transparent cursor-pointer shrink-0"
+                      />
+                      <span className="text-[11px] font-mono-tabular text-[#52525B] truncate">
+                        {selectedContentBlocks.every((b) => b.color === commonColor)
+                          ? commonColor
+                          : 'Mixed'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-[#71717A] mb-1">Alignment</label>
+                    <div className="grid grid-cols-3 gap-0.5 p-0.5 bg-[#F4F4F5] rounded-md">
+                      {(
+                        [
+                          { id: 'left', Icon: AlignLeft },
+                          { id: 'center', Icon: AlignCenter },
+                          { id: 'right', Icon: AlignRight },
+                        ] as const
+                      ).map(({ id, Icon }) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() =>
+                            onBatchUpdateContentBlocks(selectedContentIds, { align: id })
+                          }
+                          aria-label={`Align selected text ${id}`}
+                          className={`py-1.5 flex items-center justify-center rounded transition-colors ${
+                            commonAlign === id
+                              ? 'bg-white text-[#09090B] shadow-xs'
+                              : 'text-[#52525B] hover:text-[#09090B]'
+                          }`}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs text-[#18181B] cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={allUppercase}
+                    onChange={(e) =>
+                      onBatchUpdateContentBlocks(selectedContentIds, {
+                        uppercase: e.target.checked,
+                      })
+                    }
+                    className="rounded border-[#D4D4D8] accent-[#18181B]"
+                  />
+                  Uppercase all selected text
+                </label>
+              </div>
+            </>
+          )}
+
+          <hr className="border-[#F4F4F5]" />
+
+          {/* Selected Elements List */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[11px] font-semibold text-[#09090B]">In Selection</h3>
+              <button
+                type="button"
+                onClick={() => onSelectLayers([])}
+                className="text-[11px] text-[#71717A] hover:text-[#09090B]"
+              >
+                Clear
+              </button>
+            </div>
+            <div className="space-y-1">
+              {selectedLayers.map((item) => {
+                const label =
+                  item.type === 'content'
+                    ? design.contentBlocks.find((b) => b.id === item.id)?.label ?? 'Text Block'
+                    : design.assets.find((a) => a.id === item.id)?.name ?? 'Asset';
+                return (
+                  <div
+                    key={`${item.type}:${item.id}`}
+                    className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-[#FAFAFA] border border-[#E4E4E7] text-xs"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onSelectLayers([item])}
+                      className="text-left truncate text-[#09090B] hover:text-[#2563EB] flex-1"
+                    >
+                      {label}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onSelectLayers(
+                          selectedLayers.filter(
+                            (l) => !(l.type === item.type && l.id === item.id)
+                          )
+                        )
+                      }
+                      aria-label={`Remove ${label} from selection`}
+                      className="p-0.5 text-[#A1A1AA] hover:text-[#09090B]"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </aside>
+    );
+  }
+
+  const singleLayer = selectedLayers[0] ?? null;
+
   const selectedBlock =
-    selectedLayer?.type === 'content'
-      ? design.contentBlocks.find((b) => b.id === selectedLayer.id) ?? null
+    singleLayer?.type === 'content'
+      ? design.contentBlocks.find((b) => b.id === singleLayer.id) ?? null
       : null;
 
   const selectedAsset =
-    selectedLayer?.type === 'asset'
-      ? design.assets.find((a) => a.id === selectedLayer.id) ?? null
+    singleLayer?.type === 'asset'
+      ? design.assets.find((a) => a.id === singleLayer.id) ?? null
       : null;
 
   if (selectedBlock) {
@@ -109,7 +471,13 @@ export function DesignInspector({
             <input
               type="text"
               value={selectedBlock.label}
-              onChange={(e) => onUpdateContentBlock(selectedBlock.id, { label: e.target.value })}
+              onChange={(e) =>
+                onUpdateContentBlock(
+                  selectedBlock.id,
+                  { label: e.target.value },
+                  { coalesceKey: `label-${selectedBlock.id}` }
+                )
+              }
               className="w-full px-2.5 py-1.5 text-xs bg-[#FAFAFA] border border-[#E4E4E7] rounded-md text-[#09090B] focus:outline-none focus:border-[#2563EB] focus:bg-white"
             />
           </div>
@@ -176,7 +544,11 @@ export function DesignInspector({
                       value={selectedBlock.prefix}
                       placeholder="e.g. No. "
                       onChange={(e) =>
-                        onUpdateContentBlock(selectedBlock.id, { prefix: e.target.value })
+                        onUpdateContentBlock(
+                          selectedBlock.id,
+                          { prefix: e.target.value },
+                          { coalesceKey: `prefix-${selectedBlock.id}` }
+                        )
                       }
                       className="w-full px-2 py-1.5 text-xs bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
                     />
@@ -188,7 +560,11 @@ export function DesignInspector({
                       value={selectedBlock.suffix}
                       placeholder="optional"
                       onChange={(e) =>
-                        onUpdateContentBlock(selectedBlock.id, { suffix: e.target.value })
+                        onUpdateContentBlock(
+                          selectedBlock.id,
+                          { suffix: e.target.value },
+                          { coalesceKey: `suffix-${selectedBlock.id}` }
+                        )
                       }
                       className="w-full px-2 py-1.5 text-xs bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
                     />
@@ -203,7 +579,11 @@ export function DesignInspector({
                   rows={2}
                   value={selectedBlock.text}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, { text: e.target.value })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { text: e.target.value },
+                      { coalesceKey: `text-${selectedBlock.id}` }
+                    )
                   }
                   placeholder="Enter static card copy..."
                   className="w-full px-2.5 py-1.5 text-xs bg-[#FAFAFA] border border-[#E4E4E7] rounded-md text-[#09090B] focus:outline-none focus:border-[#2563EB] focus:bg-white resize-y"
@@ -217,7 +597,11 @@ export function DesignInspector({
                   rows={2}
                   value={selectedBlock.text}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, { text: e.target.value })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { text: e.target.value },
+                      { coalesceKey: `tpl-${selectedBlock.id}` }
+                    )
                   }
                   placeholder="{{Full Name}} · {{Department}}"
                   className="w-full px-2.5 py-1.5 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md text-[#09090B] focus:outline-none focus:border-[#2563EB] focus:bg-white resize-y"
@@ -283,9 +667,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedBlock.fontSizePt}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, {
-                      fontSizePt: Math.max(5, Math.min(64, Number(e.target.value) || 8)),
-                    })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { fontSizePt: Math.max(5, Math.min(64, Number(e.target.value) || 8)) },
+                      { coalesceKey: `size-${selectedBlock.id}` }
+                    )
                   }
                   className="w-full px-2.5 py-1.5 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
                 />
@@ -317,7 +703,11 @@ export function DesignInspector({
                     type="color"
                     value={selectedBlock.color || '#09090B'}
                     onChange={(e) =>
-                      onUpdateContentBlock(selectedBlock.id, { color: e.target.value })
+                      onUpdateContentBlock(
+                        selectedBlock.id,
+                        { color: e.target.value },
+                        { coalesceKey: `color-${selectedBlock.id}` }
+                      )
                     }
                     className="w-5 h-5 rounded border-0 bg-transparent cursor-pointer shrink-0"
                   />
@@ -325,7 +715,11 @@ export function DesignInspector({
                     type="text"
                     value={selectedBlock.color}
                     onChange={(e) =>
-                      onUpdateContentBlock(selectedBlock.id, { color: e.target.value })
+                      onUpdateContentBlock(
+                        selectedBlock.id,
+                        { color: e.target.value },
+                        { coalesceKey: `color-${selectedBlock.id}` }
+                      )
                     }
                     className="w-full text-[11px] font-mono-tabular bg-transparent focus:outline-none"
                   />
@@ -372,9 +766,11 @@ export function DesignInspector({
                   step={0.01}
                   value={selectedBlock.letterSpacingEm}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, {
-                      letterSpacingEm: Number(e.target.value),
-                    })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { letterSpacingEm: Number(e.target.value) },
+                      { coalesceKey: `track-${selectedBlock.id}` }
+                    )
                   }
                   className="w-full accent-[#18181B]"
                 />
@@ -420,7 +816,11 @@ export function DesignInspector({
                     type="color"
                     value={selectedBlock.backgroundColor || '#F4F4F5'}
                     onChange={(e) =>
-                      onUpdateContentBlock(selectedBlock.id, { backgroundColor: e.target.value })
+                      onUpdateContentBlock(
+                        selectedBlock.id,
+                        { backgroundColor: e.target.value },
+                        { coalesceKey: `bg-${selectedBlock.id}` }
+                      )
                     }
                     className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                   />
@@ -448,7 +848,11 @@ export function DesignInspector({
                     type="color"
                     value={selectedBlock.borderColor || '#D4D4D8'}
                     onChange={(e) =>
-                      onUpdateContentBlock(selectedBlock.id, { borderColor: e.target.value })
+                      onUpdateContentBlock(
+                        selectedBlock.id,
+                        { borderColor: e.target.value },
+                        { coalesceKey: `bc-${selectedBlock.id}` }
+                      )
                     }
                     className="w-4 h-4 bg-transparent cursor-pointer shrink-0"
                   />
@@ -470,7 +874,11 @@ export function DesignInspector({
                 step={0.5}
                 value={selectedBlock.paddingMm}
                 onChange={(e) =>
-                  onUpdateContentBlock(selectedBlock.id, { paddingMm: Number(e.target.value) })
+                  onUpdateContentBlock(
+                    selectedBlock.id,
+                    { paddingMm: Number(e.target.value) },
+                    { coalesceKey: `pad-${selectedBlock.id}` }
+                  )
                 }
                 className="w-full accent-[#18181B]"
               />
@@ -492,9 +900,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedBlock.xPct}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, {
-                      xPct: Math.max(0, Math.min(95, Number(e.target.value) || 0)),
-                    })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { xPct: Math.max(0, Math.min(95, Number(e.target.value) || 0)) },
+                      { coalesceKey: `pos-${selectedBlock.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -508,9 +918,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedBlock.yPct}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, {
-                      yPct: Math.max(0, Math.min(95, Number(e.target.value) || 0)),
-                    })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { yPct: Math.max(0, Math.min(95, Number(e.target.value) || 0)) },
+                      { coalesceKey: `pos-${selectedBlock.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -524,9 +936,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedBlock.widthPct}
                   onChange={(e) =>
-                    onUpdateContentBlock(selectedBlock.id, {
-                      widthPct: Math.max(10, Math.min(100, Number(e.target.value) || 20)),
-                    })
+                    onUpdateContentBlock(
+                      selectedBlock.id,
+                      { widthPct: Math.max(10, Math.min(100, Number(e.target.value) || 20)) },
+                      { coalesceKey: `pos-${selectedBlock.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -592,7 +1006,13 @@ export function DesignInspector({
             <input
               type="text"
               value={selectedAsset.name}
-              onChange={(e) => onUpdateAssetLayer(selectedAsset.id, { name: e.target.value })}
+              onChange={(e) =>
+                onUpdateAssetLayer(
+                  selectedAsset.id,
+                  { name: e.target.value },
+                  { coalesceKey: `asset-name-${selectedAsset.id}` }
+                )
+              }
               className="w-full px-2.5 py-1.5 text-xs bg-[#FAFAFA] border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] focus:bg-white"
             />
           </div>
@@ -628,7 +1048,11 @@ export function DesignInspector({
               step={0.05}
               value={selectedAsset.opacity}
               onChange={(e) =>
-                onUpdateAssetLayer(selectedAsset.id, { opacity: Number(e.target.value) })
+                onUpdateAssetLayer(
+                  selectedAsset.id,
+                  { opacity: Number(e.target.value) },
+                  { coalesceKey: `asset-op-${selectedAsset.id}` }
+                )
               }
               className="w-full accent-[#18181B]"
             />
@@ -645,7 +1069,11 @@ export function DesignInspector({
               step={0.5}
               value={selectedAsset.borderRadiusMm}
               onChange={(e) =>
-                onUpdateAssetLayer(selectedAsset.id, { borderRadiusMm: Number(e.target.value) })
+                onUpdateAssetLayer(
+                  selectedAsset.id,
+                  { borderRadiusMm: Number(e.target.value) },
+                  { coalesceKey: `asset-rad-${selectedAsset.id}` }
+                )
               }
               className="w-full accent-[#18181B]"
             />
@@ -665,9 +1093,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedAsset.xPct}
                   onChange={(e) =>
-                    onUpdateAssetLayer(selectedAsset.id, {
-                      xPct: Math.max(0, Math.min(96, Number(e.target.value) || 0)),
-                    })
+                    onUpdateAssetLayer(
+                      selectedAsset.id,
+                      { xPct: Math.max(0, Math.min(96, Number(e.target.value) || 0)) },
+                      { coalesceKey: `asset-pos-${selectedAsset.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -681,9 +1111,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedAsset.yPct}
                   onChange={(e) =>
-                    onUpdateAssetLayer(selectedAsset.id, {
-                      yPct: Math.max(0, Math.min(96, Number(e.target.value) || 0)),
-                    })
+                    onUpdateAssetLayer(
+                      selectedAsset.id,
+                      { yPct: Math.max(0, Math.min(96, Number(e.target.value) || 0)) },
+                      { coalesceKey: `asset-pos-${selectedAsset.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -697,9 +1129,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedAsset.widthPct}
                   onChange={(e) =>
-                    onUpdateAssetLayer(selectedAsset.id, {
-                      widthPct: Math.max(4, Math.min(100, Number(e.target.value) || 12)),
-                    })
+                    onUpdateAssetLayer(
+                      selectedAsset.id,
+                      { widthPct: Math.max(4, Math.min(100, Number(e.target.value) || 12)) },
+                      { coalesceKey: `asset-pos-${selectedAsset.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -713,9 +1147,11 @@ export function DesignInspector({
                   step={0.5}
                   value={selectedAsset.heightPct}
                   onChange={(e) =>
-                    onUpdateAssetLayer(selectedAsset.id, {
-                      heightPct: Math.max(4, Math.min(100, Number(e.target.value) || 12)),
-                    })
+                    onUpdateAssetLayer(
+                      selectedAsset.id,
+                      { heightPct: Math.max(4, Math.min(100, Number(e.target.value) || 12)) },
+                      { coalesceKey: `asset-pos-${selectedAsset.id}` }
+                    )
                   }
                   className="w-full px-2 py-1 text-xs font-mono-tabular bg-[#FAFAFA] border border-[#E4E4E7] rounded-md"
                 />
@@ -732,7 +1168,9 @@ export function DesignInspector({
     <aside className="w-[300px] shrink-0 bg-white border-l border-[#E4E4E7] flex flex-col overflow-hidden">
       <div className="px-4 py-3 border-b border-[#E4E4E7]">
         <h2 className="text-xs font-semibold text-[#09090B]">Inspector</h2>
-        <p className="text-[11px] text-[#71717A]">Select an element on the card to edit</p>
+        <p className="text-[11px] text-[#71717A]">
+          Click or drag-select elements on the card to edit
+        </p>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-5">

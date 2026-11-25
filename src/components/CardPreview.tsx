@@ -1,5 +1,12 @@
-import React, { useRef } from 'react';
-import { AssetLayer, CardDesign, ContentBlock, EntryRow, SelectedLayer } from '../types';
+import React, { useRef, useState } from 'react';
+import {
+  AssetLayer,
+  CardDesign,
+  ContentBlock,
+  DesignUpdateOptions,
+  EntryRow,
+  SelectedLayerItem,
+} from '../types';
 import { resolveBlockText } from '../utils/cardRenderer';
 
 interface CardPreviewProps {
@@ -8,11 +15,40 @@ interface CardPreviewProps {
   rowIndex: number;
   widthPx: number;
   interactive?: boolean;
-  selectedLayer?: SelectedLayer;
-  onSelectLayer?: (layer: SelectedLayer) => void;
-  onUpdateContentBlock?: (id: string, patch: Partial<ContentBlock>) => void;
-  onUpdateAssetLayer?: (id: string, patch: Partial<AssetLayer>) => void;
+  selectedLayers?: SelectedLayerItem[];
+  onSelectLayers?: (layers: SelectedLayerItem[]) => void;
+  onUpdateDesign?: (
+    updater: (prev: CardDesign) => CardDesign,
+    options?: DesignUpdateOptions
+  ) => void;
+  onUpdateContentBlock?: (
+    id: string,
+    patch: Partial<ContentBlock>,
+    options?: DesignUpdateOptions
+  ) => void;
+  onUpdateAssetLayer?: (
+    id: string,
+    patch: Partial<AssetLayer>,
+    options?: DesignUpdateOptions
+  ) => void;
+  onBeginDragTransaction?: () => void;
+  onEndDragTransaction?: (didChange: boolean) => void;
   showReferenceGhost?: boolean;
+}
+
+interface MarqueeBox {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+}
+
+function isLayerSelected(
+  layers: SelectedLayerItem[],
+  type: 'content' | 'asset',
+  id: string
+): boolean {
+  return layers.some((l) => l.type === type && l.id === id);
 }
 
 export function CardPreview({
@@ -21,65 +57,285 @@ export function CardPreview({
   rowIndex,
   widthPx,
   interactive = false,
-  selectedLayer = null,
-  onSelectLayer,
+  selectedLayers = [],
+  onSelectLayers,
+  onUpdateDesign,
   onUpdateContentBlock,
   onUpdateAssetLayer,
+  onBeginDragTransaction,
+  onEndDragTransaction,
   showReferenceGhost = false,
 }: CardPreviewProps) {
   const cardRef = useRef<HTMLDivElement>(null);
+  const [marquee, setMarquee] = useState<MarqueeBox | null>(null);
+  const suppressNextCardClickRef = useRef(false);
 
   const pxPerMm = widthPx / Math.max(10, design.widthMm);
   const heightPx = design.heightMm * pxPerMm;
   const ptToPx = (pt: number) => (pt * pxPerMm * 25.4) / 72;
 
-  const startDrag = (
+  const startMarqueeSelection = (e: React.PointerEvent) => {
+    if (!interactive || !cardRef.current || e.button !== 0) return;
+    // Only start marquee when clicking directly on card background
+    if (e.target !== e.currentTarget) return;
+
+    e.preventDefault();
+    const rect = cardRef.current.getBoundingClientRect();
+    const startX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const startY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    const baseSelection = additive ? [...selectedLayers] : [];
+
+    let didDrag = false;
+    setMarquee({ startX, startY, currentX: startX, currentY: startY });
+
+    const computeIntersectedLayers = (box: MarqueeBox): SelectedLayerItem[] => {
+      const left = Math.min(box.startX, box.currentX);
+      const right = Math.max(box.startX, box.currentX);
+      const top = Math.min(box.startY, box.currentY);
+      const bottom = Math.max(box.startY, box.currentY);
+
+      const hits: SelectedLayerItem[] = [...baseSelection];
+      const nodes = cardRef.current?.querySelectorAll<HTMLElement>('[data-layer-type][data-layer-id]');
+      if (!nodes) return hits;
+
+      nodes.forEach((node) => {
+        const nr = node.getBoundingClientRect();
+        const nl = nr.left - rect.left;
+        const nrRight = nr.right - rect.left;
+        const nt = nr.top - rect.top;
+        const nb = nr.bottom - rect.top;
+
+        const intersects = !(nrRight < left || nl > right || nb < top || nt > bottom);
+        if (intersects) {
+          const type = node.dataset.layerType as 'content' | 'asset';
+          const id = node.dataset.layerId ?? '';
+          if (id && !isLayerSelected(hits, type, id)) {
+            hits.push({ type, id });
+          }
+        }
+      });
+
+      return hits;
+    };
+
+    const onMove = (ev: PointerEvent) => {
+      const currentX = Math.max(0, Math.min(rect.width, ev.clientX - rect.left));
+      const currentY = Math.max(0, Math.min(rect.height, ev.clientY - rect.top));
+      if (Math.abs(currentX - startX) > 4 || Math.abs(currentY - startY) > 4) {
+        didDrag = true;
+      }
+      const nextBox = { startX, startY, currentX, currentY };
+      setMarquee(nextBox);
+      if (didDrag) {
+        onSelectLayers?.(computeIntersectedLayers(nextBox));
+      }
+    };
+
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      setMarquee(null);
+      if (didDrag) {
+        suppressNextCardClickRef.current = true;
+      } else if (!additive) {
+        onSelectLayers?.([]);
+      }
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const startElementDrag = (
     e: React.PointerEvent,
     type: 'content' | 'asset',
     id: string,
     mode: 'move' | 'resize'
   ) => {
-    if (!interactive || !cardRef.current) return;
+    if (!interactive || !cardRef.current || e.button !== 0) return;
     e.stopPropagation();
     e.preventDefault();
 
-    onSelectLayer?.({ type, id });
+    const isAdditive = e.shiftKey || e.metaKey || e.ctrlKey;
+    const alreadySelected = isLayerSelected(selectedLayers, type, id);
+
+    let activeGroup: SelectedLayerItem[] = selectedLayers;
+
+    if (mode === 'move') {
+      if (isAdditive) {
+        if (alreadySelected) {
+          const next = selectedLayers.filter((l) => !(l.type === type && l.id === id));
+          onSelectLayers?.(next);
+          return;
+        } else {
+          activeGroup = [...selectedLayers, { type, id }];
+          onSelectLayers?.(activeGroup);
+        }
+      } else if (!alreadySelected) {
+        activeGroup = [{ type, id }];
+        onSelectLayers?.(activeGroup);
+      }
+    } else {
+      activeGroup = [{ type, id }];
+      onSelectLayers?.(activeGroup);
+    }
 
     const rect = cardRef.current.getBoundingClientRect();
     const startX = e.clientX;
     const startY = e.clientY;
+    let didChange = false;
 
-    if (type === 'content') {
-      const block = design.contentBlocks.find((b) => b.id === id);
-      if (!block) return;
-      const origX = block.xPct;
-      const origY = block.yPct;
-      const origW = block.widthPct;
+    onBeginDragTransaction?.();
+
+    if (mode === 'move') {
+      const selectedContentIds = new Set(
+        activeGroup.filter((l) => l.type === 'content').map((l) => l.id)
+      );
+      const selectedAssetIds = new Set(
+        activeGroup.filter((l) => l.type === 'asset').map((l) => l.id)
+      );
+
+      const initialBlocks = new Map<string, { xPct: number; yPct: number; widthPct: number }>();
+      design.contentBlocks.forEach((b) => {
+        if (selectedContentIds.has(b.id)) {
+          initialBlocks.set(b.id, { xPct: b.xPct, yPct: b.yPct, widthPct: b.widthPct });
+        }
+      });
+
+      const initialAssets = new Map<
+        string,
+        { xPct: number; yPct: number; widthPct: number; heightPct: number }
+      >();
+      design.assets.forEach((a) => {
+        if (selectedAssetIds.has(a.id)) {
+          initialAssets.set(a.id, {
+            xPct: a.xPct,
+            yPct: a.yPct,
+            widthPct: a.widthPct,
+            heightPct: a.heightPct,
+          });
+        }
+      });
+
+      // Compute shared group clamp bounds so moving a group preserves relative offsets cleanly
+      let minDx = -Infinity;
+      let maxDx = Infinity;
+      let minDy = -Infinity;
+      let maxDy = Infinity;
+
+      initialBlocks.forEach((b) => {
+        minDx = Math.max(minDx, -b.xPct);
+        maxDx = Math.min(maxDx, 100 - b.widthPct - b.xPct);
+        minDy = Math.max(minDy, -b.yPct);
+        maxDy = Math.min(maxDy, 94 - b.yPct);
+      });
+      initialAssets.forEach((a) => {
+        minDx = Math.max(minDx, -a.xPct);
+        maxDx = Math.min(maxDx, 100 - a.widthPct - a.xPct);
+        minDy = Math.max(minDy, -a.yPct);
+        maxDy = Math.min(maxDy, 100 - a.heightPct - a.yPct);
+      });
 
       const onMove = (ev: PointerEvent) => {
-        const dxPct = ((ev.clientX - startX) / rect.width) * 100;
-        const dyPct = ((ev.clientY - startY) / rect.height) * 100;
+        const rawDx = ((ev.clientX - startX) / rect.width) * 100;
+        const rawDy = ((ev.clientY - startY) / rect.height) * 100;
 
-        if (mode === 'move') {
-          const nextX = Math.max(0, Math.min(100 - origW, Math.round((origX + dxPct) * 2) / 2));
-          const nextY = Math.max(0, Math.min(94, Math.round((origY + dyPct) * 2) / 2));
-          onUpdateContentBlock?.(id, { xPct: nextX, yPct: nextY });
+        const dxPct = Math.round(Math.max(minDx, Math.min(maxDx, rawDx)) * 2) / 2;
+        const dyPct = Math.round(Math.max(minDy, Math.min(maxDy, rawDy)) * 2) / 2;
+
+        if (Math.abs(dxPct) > 0 || Math.abs(dyPct) > 0) {
+          didChange = true;
+        }
+
+        if (onUpdateDesign) {
+          onUpdateDesign(
+            (prev) => ({
+              ...prev,
+              contentBlocks: prev.contentBlocks.map((b) => {
+                const init = initialBlocks.get(b.id);
+                if (!init) return b;
+                return {
+                  ...b,
+                  xPct: Math.round((init.xPct + dxPct) * 2) / 2,
+                  yPct: Math.round((init.yPct + dyPct) * 2) / 2,
+                };
+              }),
+              assets: prev.assets.map((a) => {
+                const init = initialAssets.get(a.id);
+                if (!init) return a;
+                return {
+                  ...a,
+                  xPct: Math.round((init.xPct + dxPct) * 2) / 2,
+                  yPct: Math.round((init.yPct + dyPct) * 2) / 2,
+                };
+              }),
+            }),
+            { skipHistory: true }
+          );
+        } else if (type === 'content') {
+          const init = initialBlocks.get(id);
+          if (init) {
+            onUpdateContentBlock?.(
+              id,
+              { xPct: init.xPct + dxPct, yPct: init.yPct + dyPct },
+              { skipHistory: true }
+            );
+          }
         } else {
-          const nextW = Math.max(10, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
-          onUpdateContentBlock?.(id, { widthPct: nextW });
+          const init = initialAssets.get(id);
+          if (init) {
+            onUpdateAssetLayer?.(
+              id,
+              { xPct: init.xPct + dxPct, yPct: init.yPct + dyPct },
+              { skipHistory: true }
+            );
+          }
         }
       };
 
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        onEndDragTransaction?.(didChange);
+      };
+
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      return;
+    }
+
+    // Resize mode (single item)
+    if (type === 'content') {
+      const block = design.contentBlocks.find((b) => b.id === id);
+      if (!block) {
+        onEndDragTransaction?.(false);
+        return;
+      }
+      const origX = block.xPct;
+      const origW = block.widthPct;
+
+      const onMove = (ev: PointerEvent) => {
+        const dxPct = ((ev.clientX - startX) / rect.width) * 100;
+        const nextW = Math.max(10, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
+        if (nextW !== origW) didChange = true;
+        onUpdateContentBlock?.(id, { widthPct: nextW }, { skipHistory: true });
+      };
+
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        onEndDragTransaction?.(didChange);
       };
 
       window.addEventListener('pointermove', onMove);
       window.addEventListener('pointerup', onUp);
     } else {
       const asset = design.assets.find((a) => a.id === id);
-      if (!asset) return;
+      if (!asset) {
+        onEndDragTransaction?.(false);
+        return;
+      }
       const origX = asset.xPct;
       const origY = asset.yPct;
       const origW = asset.widthPct;
@@ -88,21 +344,16 @@ export function CardPreview({
       const onMove = (ev: PointerEvent) => {
         const dxPct = ((ev.clientX - startX) / rect.width) * 100;
         const dyPct = ((ev.clientY - startY) / rect.height) * 100;
-
-        if (mode === 'move') {
-          const nextX = Math.max(0, Math.min(100 - origW, Math.round((origX + dxPct) * 2) / 2));
-          const nextY = Math.max(0, Math.min(100 - origH, Math.round((origY + dyPct) * 2) / 2));
-          onUpdateAssetLayer?.(id, { xPct: nextX, yPct: nextY });
-        } else {
-          const nextW = Math.max(4, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
-          const nextH = Math.max(4, Math.min(100 - origY, Math.round((origH + dyPct) * 2) / 2));
-          onUpdateAssetLayer?.(id, { widthPct: nextW, heightPct: nextH });
-        }
+        const nextW = Math.max(4, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
+        const nextH = Math.max(4, Math.min(100 - origY, Math.round((origH + dyPct) * 2) / 2));
+        if (nextW !== origW || nextH !== origH) didChange = true;
+        onUpdateAssetLayer?.(id, { widthPct: nextW, heightPct: nextH }, { skipHistory: true });
       };
 
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        onEndDragTransaction?.(didChange);
       };
 
       window.addEventListener('pointermove', onMove);
@@ -114,12 +365,22 @@ export function CardPreview({
   const insetPx = design.borderInsetMm * pxPerMm;
   const strokePx = Math.max(1, design.borderWidthMm * pxPerMm);
   const doubleGapPx = Math.max(strokePx * 2.2, 1.1 * pxPerMm);
+  const isSingleSelected = selectedLayers.length === 1;
 
   return (
     <div
       ref={cardRef}
-      onClick={() => {
-        if (interactive) onSelectLayer?.(null);
+      onPointerDown={startMarqueeSelection}
+      onClick={(e) => {
+        if (!interactive) return;
+        e.stopPropagation();
+        if (suppressNextCardClickRef.current) {
+          suppressNextCardClickRef.current = false;
+          return;
+        }
+        if (e.target === e.currentTarget && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+          onSelectLayers?.([]);
+        }
       }}
       style={{
         width: `${widthPx}px`,
@@ -223,17 +484,17 @@ export function CardPreview({
 
       {/* Uploaded Graphic Assets */}
       {design.assets.map((asset) => {
-        const isSelected =
-          interactive && selectedLayer?.type === 'asset' && selectedLayer.id === asset.id;
+        const isSelected = interactive && isLayerSelected(selectedLayers, 'asset', asset.id);
 
         return (
           <div
             key={asset.id}
-            onPointerDown={(e) => startDrag(e, 'asset', asset.id, 'move')}
+            data-layer-type="asset"
+            data-layer-id={asset.id}
+            onPointerDown={(e) => startElementDrag(e, 'asset', asset.id, 'move')}
             onClick={(e) => {
               if (!interactive) return;
               e.stopPropagation();
-              onSelectLayer?.({ type: 'asset', id: asset.id });
             }}
             style={{
               left: `${asset.xPct}%`,
@@ -245,7 +506,7 @@ export function CardPreview({
             className={`absolute ${
               interactive
                 ? isSelected
-                  ? 'ring-1 ring-[#2563EB] cursor-move z-30'
+                  ? 'ring-1 ring-[#2563EB] bg-[#2563EB]/[0.04] cursor-move z-30'
                   : 'hover:ring-1 hover:ring-[#2563EB]/45 cursor-move z-10'
                 : 'pointer-events-none'
             }`}
@@ -262,9 +523,9 @@ export function CardPreview({
               }}
               className="w-full h-full pointer-events-none"
             />
-            {isSelected && (
+            {isSelected && isSingleSelected && (
               <div
-                onPointerDown={(e) => startDrag(e, 'asset', asset.id, 'resize')}
+                onPointerDown={(e) => startElementDrag(e, 'asset', asset.id, 'resize')}
                 title="Drag to resize"
                 className="absolute -right-1.5 -bottom-1.5 w-3 h-3 bg-white border-2 border-[#2563EB] rounded-[2px] cursor-nwse-resize"
               />
@@ -275,8 +536,7 @@ export function CardPreview({
 
       {/* Content Blocks */}
       {design.contentBlocks.map((block) => {
-        const isSelected =
-          interactive && selectedLayer?.type === 'content' && selectedLayer.id === block.id;
+        const isSelected = interactive && isLayerSelected(selectedLayers, 'content', block.id);
         const resolvedText = resolveBlockText(block, entry, rowIndex);
         const fontSizePx = ptToPx(block.fontSizePt);
         const padPx = block.paddingMm * pxPerMm;
@@ -284,11 +544,12 @@ export function CardPreview({
         return (
           <div
             key={block.id}
-            onPointerDown={(e) => startDrag(e, 'content', block.id, 'move')}
+            data-layer-type="content"
+            data-layer-id={block.id}
+            onPointerDown={(e) => startElementDrag(e, 'content', block.id, 'move')}
             onClick={(e) => {
               if (!interactive) return;
               e.stopPropagation();
-              onSelectLayer?.({ type: 'content', id: block.id });
             }}
             style={{
               left: `${block.xPct}%`,
@@ -311,15 +572,15 @@ export function CardPreview({
             className={`absolute whitespace-pre-wrap break-words ${
               interactive
                 ? isSelected
-                  ? 'ring-1 ring-[#2563EB] cursor-move z-30'
+                  ? 'ring-1 ring-[#2563EB] bg-[#2563EB]/[0.04] cursor-move z-30'
                   : 'hover:ring-1 hover:ring-[#2563EB]/45 cursor-move z-10'
                 : 'pointer-events-none'
             }`}
           >
             {resolvedText || (interactive ? <span className="opacity-35 italic">Empty</span> : '')}
-            {isSelected && (
+            {isSelected && isSingleSelected && (
               <div
-                onPointerDown={(e) => startDrag(e, 'content', block.id, 'resize')}
+                onPointerDown={(e) => startElementDrag(e, 'content', block.id, 'resize')}
                 title="Drag to resize width"
                 className="absolute -right-1.5 top-1/2 -translate-y-1/2 w-2.5 h-4 bg-white border-2 border-[#2563EB] rounded-[2px] cursor-ew-resize"
               />
@@ -327,6 +588,21 @@ export function CardPreview({
           </div>
         );
       })}
+
+      {/* Marquee Selection Rectangle */}
+      {marquee &&
+        (Math.abs(marquee.currentX - marquee.startX) > 3 ||
+          Math.abs(marquee.currentY - marquee.startY) > 3) && (
+          <div
+            style={{
+              left: `${Math.min(marquee.startX, marquee.currentX)}px`,
+              top: `${Math.min(marquee.startY, marquee.currentY)}px`,
+              width: `${Math.abs(marquee.currentX - marquee.startX)}px`,
+              height: `${Math.abs(marquee.currentY - marquee.startY)}px`,
+            }}
+            className="absolute z-40 pointer-events-none bg-[#2563EB]/10 border border-[#2563EB]"
+          />
+        )}
     </div>
   );
 }

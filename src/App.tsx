@@ -3,6 +3,7 @@ import { CheckCircle2, X } from 'lucide-react';
 import {
   CardDesign,
   CellSelectionConfig,
+  DesignUpdateOptions,
   FolioPressProjectFile,
   PrintSheetConfig,
   SpreadsheetData,
@@ -34,6 +35,8 @@ import { PrintSheetView } from './components/PrintSheetView';
 import { ProjectsDrawer } from './components/ProjectsDrawer';
 
 const DEFAULT_PROJECT_NAME = 'Annual Charity Raffle';
+const MAX_HISTORY_STEPS = 60;
+const COALESCE_WINDOW_MS = 500;
 
 function remapDesignToNewColumns(prev: CardDesign, newColumns: string[]): CardDesign {
   if (newColumns.length === 0) return prev;
@@ -111,6 +114,101 @@ export default function App() {
   );
   const [activeEntryIndex, setActiveEntryIndex] = useState(0);
 
+  // Undo / Redo history stack for CardDesign
+  const [history, setHistory] = useState<{ past: CardDesign[]; future: CardDesign[] }>({
+    past: [],
+    future: [],
+  });
+  const designRef = useRef<CardDesign>(design);
+  designRef.current = design;
+  const transactionBaseRef = useRef<CardDesign | null>(null);
+  const lastCoalesceRef = useRef<{ key: string; at: number } | null>(null);
+
+  const resetHistory = useCallback(() => {
+    setHistory({ past: [], future: [] });
+    transactionBaseRef.current = null;
+    lastCoalesceRef.current = null;
+  }, []);
+
+  const updateDesignWithHistory = useCallback(
+    (updater: (prev: CardDesign) => CardDesign, options?: DesignUpdateOptions) => {
+      const prevDesign = designRef.current;
+      const nextDesign = updater(prevDesign);
+      if (nextDesign === prevDesign) return;
+
+      if (!options?.skipHistory) {
+        const now = Date.now();
+        const key = options?.coalesceKey;
+        const shouldCoalesce =
+          Boolean(key) &&
+          lastCoalesceRef.current !== null &&
+          lastCoalesceRef.current.key === key &&
+          now - lastCoalesceRef.current.at < COALESCE_WINDOW_MS;
+
+        if (!shouldCoalesce) {
+          setHistory((h) => ({
+            past: [...h.past.slice(-(MAX_HISTORY_STEPS - 1)), prevDesign],
+            future: [],
+          }));
+        } else {
+          setHistory((h) => (h.future.length > 0 ? { ...h, future: [] } : h));
+        }
+
+        lastCoalesceRef.current = key ? { key, at: now } : null;
+      }
+
+      designRef.current = nextDesign;
+      setDesign(nextDesign);
+    },
+    []
+  );
+
+  const handleBeginDesignTransaction = useCallback(() => {
+    transactionBaseRef.current = designRef.current;
+    lastCoalesceRef.current = null;
+  }, []);
+
+  const handleEndDesignTransaction = useCallback((didChange: boolean) => {
+    const base = transactionBaseRef.current;
+    transactionBaseRef.current = null;
+    if (didChange && base && base !== designRef.current) {
+      setHistory((h) => ({
+        past: [...h.past.slice(-(MAX_HISTORY_STEPS - 1)), base],
+        future: [],
+      }));
+    }
+  }, []);
+
+  const handleUndoDesign = useCallback(() => {
+    lastCoalesceRef.current = null;
+    setHistory((h) => {
+      if (h.past.length === 0) return h;
+      const previous = h.past[h.past.length - 1];
+      const current = designRef.current;
+      designRef.current = previous;
+      setDesign(previous);
+      return {
+        past: h.past.slice(0, -1),
+        future: [current, ...h.future.slice(0, MAX_HISTORY_STEPS - 1)],
+      };
+    });
+  }, []);
+
+  const handleRedoDesign = useCallback(() => {
+    lastCoalesceRef.current = null;
+    setHistory((h) => {
+      if (h.future.length === 0) return h;
+      const next = h.future[0];
+      const current = designRef.current;
+      designRef.current = next;
+      setDesign(next);
+      return {
+        past: [...h.past.slice(-(MAX_HISTORY_STEPS - 1)), current],
+        future: h.future.slice(1),
+      };
+    });
+  }, []);
+
   // Local project file system & auto-save state
   const [isProjectsDrawerOpen, setIsProjectsDrawerOpen] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
@@ -140,12 +238,14 @@ export default function App() {
         suppressNextDirtyRef.current = true;
         setProjectName(draft.projectName || DEFAULT_PROJECT_NAME);
         setSpreadsheet(draft.spreadsheet);
+        designRef.current = draft.design;
         setDesign(draft.design);
         setSheetConfig(draft.sheetConfig);
         setHasUnsavedChanges(Boolean(draft.hasUnsavedChanges));
         setLastSavedAt(draft.lastExplicitSaveAt ?? null);
         setLastAutoSavedAt(draft.updatedAt ?? null);
         setActiveEntryIndex(0);
+        resetHistory();
       } else {
         suppressNextDirtyRef.current = false;
       }
@@ -154,7 +254,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [resetHistory]);
 
   // Track edits and debounce auto-save to IndexedDB
   useEffect(() => {
@@ -262,6 +362,7 @@ export default function App() {
       suppressNextDirtyRef.current = true;
       setProjectName(project.projectName);
       setSpreadsheet(project.spreadsheet);
+      designRef.current = project.design;
       setDesign(project.design);
       setSheetConfig(project.sheetConfig);
       setActiveEntryIndex(0);
@@ -269,6 +370,7 @@ export default function App() {
       setLinkedFileName(fileName);
       setLastSavedAt(project.savedAt);
       setHasUnsavedChanges(false);
+      resetHistory();
 
       if (autoSaveEnabled) {
         const now = new Date().toISOString();
@@ -288,14 +390,16 @@ export default function App() {
         message: `Opened "${project.projectName}" (${project.spreadsheet.entries.length} cards).`,
       });
     },
-    [autoSaveEnabled]
+    [autoSaveEnabled, resetHistory]
   );
 
   const handleCreateNewProject = useCallback(() => {
+    const initialDesign = createInitialCardDesign();
     suppressNextDirtyRef.current = true;
     setProjectName(DEFAULT_PROJECT_NAME);
     setSpreadsheet(createInitialSpreadsheet());
-    setDesign(createInitialCardDesign());
+    designRef.current = initialDesign;
+    setDesign(initialDesign);
     setSheetConfig(createInitialPrintSheetConfig());
     setActiveEntryIndex(0);
     setActiveFileHandle(null);
@@ -303,12 +407,13 @@ export default function App() {
     setLastSavedAt(null);
     setHasUnsavedChanges(false);
     setLastAutoSavedAt(null);
+    resetHistory();
     void clearAutoSaveDraft();
     setNotice({
       type: 'success',
       message: 'Started a fresh starter project.',
     });
-  }, []);
+  }, [resetHistory]);
 
   const handleToggleAutoSave = useCallback(
     (enabled: boolean) => {
@@ -352,7 +457,7 @@ export default function App() {
         columns.some((col, idx) => col !== prev.columns[idx]);
 
       if (columnsChanged && columns.length > 0) {
-        setDesign((d) => remapDesignToNewColumns(d, columns));
+        updateDesignWithHistory((d) => remapDesignToNewColumns(d, columns));
       }
 
       setActiveEntryIndex((idx) =>
@@ -385,45 +490,51 @@ export default function App() {
         },
       };
     },
-    []
+    [updateDesignWithHistory]
   );
 
-  const handleImportSpreadsheet = useCallback((nextData: SpreadsheetData) => {
-    setSpreadsheet(nextData);
-    setActiveEntryIndex(0);
-    setSheetConfig((prev) => ({
-      ...prev,
-      rangeStart: 1,
-      rangeEnd: Math.max(1, nextData.entries.length),
-    }));
-    setDesign((prev) => remapDesignToNewColumns(prev, nextData.columns));
-    setNotice({
-      type: 'success',
-      message: `Imported ${nextData.entries.length} entries from ${nextData.fileName}. You can adjust the selected cells anytime in Data.`,
-    });
-  }, []);
-
-  const handleSwitchSheet = useCallback((sheetName: string) => {
-    setSpreadsheet((prev) => {
-      const sheet = prev.workbookSheets[sheetName];
-      if (!sheet) return prev;
-      setDesign((d) => remapDesignToNewColumns(d, sheet.columns));
-      setSheetConfig((sc) => ({
-        ...sc,
-        rangeStart: 1,
-        rangeEnd: Math.max(1, sheet.entries.length),
-      }));
+  const handleImportSpreadsheet = useCallback(
+    (nextData: SpreadsheetData) => {
+      setSpreadsheet(nextData);
       setActiveEntryIndex(0);
-      return {
+      setSheetConfig((prev) => ({
         ...prev,
-        activeSheet: sheetName,
-        rawRows: sheet.rawRows,
-        selection: sheet.selection,
-        columns: sheet.columns,
-        entries: sheet.entries,
-      };
-    });
-  }, []);
+        rangeStart: 1,
+        rangeEnd: Math.max(1, nextData.entries.length),
+      }));
+      updateDesignWithHistory((prev) => remapDesignToNewColumns(prev, nextData.columns));
+      setNotice({
+        type: 'success',
+        message: `Imported ${nextData.entries.length} entries from ${nextData.fileName}. You can adjust the selected cells anytime in Data.`,
+      });
+    },
+    [updateDesignWithHistory]
+  );
+
+  const handleSwitchSheet = useCallback(
+    (sheetName: string) => {
+      setSpreadsheet((prev) => {
+        const sheet = prev.workbookSheets[sheetName];
+        if (!sheet) return prev;
+        updateDesignWithHistory((d) => remapDesignToNewColumns(d, sheet.columns));
+        setSheetConfig((sc) => ({
+          ...sc,
+          rangeStart: 1,
+          rangeEnd: Math.max(1, sheet.entries.length),
+        }));
+        setActiveEntryIndex(0);
+        return {
+          ...prev,
+          activeSheet: sheetName,
+          rawRows: sheet.rawRows,
+          selection: sheet.selection,
+          columns: sheet.columns,
+          entries: sheet.entries,
+        };
+      });
+    },
+    [updateDesignWithHistory]
+  );
 
   const handleUpdateSelection = useCallback(
     (nextSelection: CellSelectionConfig) => {
@@ -524,10 +635,10 @@ export default function App() {
   const handleRestoreSample = useCallback(() => {
     const sample = createInitialSpreadsheet();
     setSpreadsheet(sample);
-    setDesign(createInitialCardDesign());
+    updateDesignWithHistory(() => createInitialCardDesign());
     setSheetConfig(createInitialPrintSheetConfig());
     setActiveEntryIndex(0);
-  }, []);
+  }, [updateDesignWithHistory]);
 
   const handleExportPdf = useCallback(async () => {
     setNotice(null);
@@ -623,9 +734,15 @@ export default function App() {
           columns={spreadsheet.columns}
           sheetConfig={sheetConfig}
           activeEntryIndex={activeEntryIndex}
+          canUndo={history.past.length > 0}
+          canRedo={history.future.length > 0}
+          onUndo={handleUndoDesign}
+          onRedo={handleRedoDesign}
+          onBeginDesignTransaction={handleBeginDesignTransaction}
+          onEndDesignTransaction={handleEndDesignTransaction}
           onChangeActiveEntryIndex={setActiveEntryIndex}
-          onUpdateDesign={setDesign}
-          onResetDesign={() => setDesign(createInitialCardDesign())}
+          onUpdateDesign={updateDesignWithHistory}
+          onResetDesign={() => updateDesignWithHistory(() => createInitialCardDesign())}
         />
       )}
 
