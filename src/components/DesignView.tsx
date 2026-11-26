@@ -3,12 +3,16 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  Grid3X3,
   Image as ImageIcon,
   Layers,
   Loader2,
+  Magnet,
+  Minus,
   Plus,
   Redo2,
   RotateCcw,
+  Ruler,
   Trash2,
   Undo2,
   Upload,
@@ -24,6 +28,7 @@ import {
   EntryRow,
   ImageFit,
   PrintSheetConfig,
+  RulerGuide,
   SelectedLayerItem,
 } from '../types';
 import { CARD_SIZE_PRESETS } from '../utils/sampleData';
@@ -34,6 +39,7 @@ import {
   mmToIn,
 } from '../utils/cardRenderer';
 import { CardPreview } from './CardPreview';
+import { CanvasRulerFrame } from './CanvasRulerFrame';
 import { DesignInspector, GroupAlignmentAction } from './DesignInspector';
 
 type RailTab = 'format' | 'reference' | 'assets' | 'contents';
@@ -118,13 +124,113 @@ export function DesignView({
   const [railTab, setRailTab] = useState<RailTab>('format');
   const [selectedLayers, setSelectedLayers] = useState<SelectedLayerItem[]>([]);
   const [zoomPct, setZoomPct] = useState<number>(100);
+  const [showGrid, setShowGrid] = useState<boolean>(true);
+  const [showRulers, setShowRulers] = useState<boolean>(true);
+  const [snapToGrid, setSnapToGrid] = useState<boolean>(true);
+  const [gridSpacingMm, setGridSpacingMm] = useState<number>(5);
+  const [guides, setGuides] = useState<RulerGuide[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisSummary, setAnalysisSummary] = useState<string | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
+  const handleAddGuide = useCallback((guide: RulerGuide) => {
+    setGuides((prev) => [...prev, guide]);
+  }, []);
+
+  const handleUpdateGuide = useCallback((id: string, positionMm: number) => {
+    setGuides((prev) => prev.map((g) => (g.id === id ? { ...g, positionMm } : g)));
+  }, []);
+
+  const handleRemoveGuide = useCallback((id: string) => {
+    setGuides((prev) => prev.filter((g) => g.id !== id));
+  }, []);
+
+  const handleClearGuides = useCallback(() => {
+    setGuides([]);
+  }, []);
+
+  const gridSpacingOptions =
+    design.unit === 'in'
+      ? [
+          { label: '0.1 in', mm: 2.54 },
+          { label: '0.25 in', mm: 6.35 },
+          { label: '0.5 in', mm: 12.7 },
+        ]
+      : [
+          { label: '2 mm', mm: 2 },
+          { label: '5 mm', mm: 5 },
+          { label: '10 mm', mm: 10 },
+        ];
+
+  const activeGridOptionMm = gridSpacingOptions.reduce((closest, opt) =>
+    Math.abs(opt.mm - gridSpacingMm) < Math.abs(closest.mm - gridSpacingMm) ? opt : closest
+  ).mm;
+
   const refInputRef = useRef<HTMLInputElement>(null);
   const bgInputRef = useRef<HTMLInputElement>(null);
   const assetInputRef = useRef<HTMLInputElement>(null);
+  const canvasViewportRef = useRef<HTMLDivElement>(null);
+  const exactZoomRef = useRef<number>(100);
+
+  const setZoomClamped = useCallback((nextZoom: number) => {
+    const clamped = Math.min(300, Math.max(25, nextZoom));
+    exactZoomRef.current = clamped;
+    setZoomPct(Math.round(clamped));
+  }, []);
+
+  // Scroll-wheel & trackpad pinch zooming over the drafting canvas
+  useEffect(() => {
+    const viewport = canvasViewportRef.current;
+    if (!viewport) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      // Allow Shift+scroll to pan horizontally if the user wants
+      if (e.shiftKey && !e.ctrlKey && !e.metaKey) return;
+
+      e.preventDefault();
+
+      const normalizedDelta =
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+          ? e.deltaY * 400
+          : e.deltaY;
+
+      if (normalizedDelta === 0) return;
+
+      const sensitivity = e.ctrlKey || e.metaKey ? 0.008 : 0.0014;
+      const prevExact = exactZoomRef.current;
+      const nextExact = Math.min(300, Math.max(25, prevExact * Math.exp(-normalizedDelta * sensitivity)));
+      exactZoomRef.current = nextExact;
+
+      const prevRounded = Math.round(prevExact);
+      const nextRounded = Math.round(nextExact);
+
+      if (nextRounded === prevRounded) return;
+
+      // Capture pointer position relative to scrollable content to keep zoom anchored around cursor
+      const rect = viewport.getBoundingClientRect();
+      const pointerX = e.clientX - rect.left;
+      const pointerY = e.clientY - rect.top;
+      const contentX = viewport.scrollLeft + pointerX;
+      const contentY = viewport.scrollTop + pointerY;
+      const ratio = nextRounded / prevRounded;
+
+      setZoomPct(nextRounded);
+
+      requestAnimationFrame(() => {
+        if (viewport.scrollWidth > viewport.clientWidth) {
+          viewport.scrollLeft = contentX * ratio - pointerX;
+        }
+        if (viewport.scrollHeight > viewport.clientHeight) {
+          viewport.scrollTop = contentY * ratio - pointerY;
+        }
+      });
+    };
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, []);
 
   const safeEntryIndex = entries.length > 0 ? Math.min(activeEntryIndex, entries.length - 1) : 0;
   const activeEntry = entries[safeEntryIndex];
@@ -346,6 +452,24 @@ export function DesignView({
           ...design.contentBlocks.map((b) => ({ type: 'content' as const, id: b.id })),
           ...design.assets.map((a) => ({ type: 'asset' as const, id: a.id })),
         ]);
+        return;
+      }
+
+      if (mod && (e.key === '=' || e.key === '+')) {
+        e.preventDefault();
+        setZoomClamped(exactZoomRef.current + 15);
+        return;
+      }
+
+      if (mod && e.key === '-') {
+        e.preventDefault();
+        setZoomClamped(exactZoomRef.current - 15);
+        return;
+      }
+
+      if (mod && e.key === '0') {
+        e.preventDefault();
+        setZoomClamped(100);
         return;
       }
 
@@ -1719,9 +1843,9 @@ export function DesignView({
       {/* Center Interactive Drafting Canvas */}
       <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {/* Canvas Toolbar */}
-        <div className="h-11 shrink-0 px-5 bg-white/80 backdrop-blur-xs border-b border-[#E4E4E7] flex items-center justify-between gap-4">
+        <div className="h-11 shrink-0 px-4 bg-white/80 backdrop-blur-xs border-b border-[#E4E4E7] flex items-center justify-between gap-3 overflow-x-auto">
           {/* Left: Entry Stepper + Undo/Redo + Dimensions */}
-          <div className="flex items-center gap-3 min-w-0">
+          <div className="flex items-center gap-2.5 shrink-0">
             <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white">
               <button
                 type="button"
@@ -1772,7 +1896,7 @@ export function DesignView({
               </button>
             </div>
 
-            <div className="hidden xl:flex items-center gap-2 text-[11px] text-[#71717A] font-mono-tabular truncate">
+            <div className="hidden 2xl:flex items-center gap-2 text-[11px] text-[#71717A] font-mono-tabular whitespace-nowrap">
               <span>
                 {formatDimension(design.widthMm, design.unit)} ×{' '}
                 {formatDimension(design.heightMm, design.unit)}
@@ -1780,61 +1904,177 @@ export function DesignView({
               <span aria-hidden="true">·</span>
               <span>
                 {sheetMetrics.fitsOnPage
-                  ? `${sheetMetrics.cardsPerPage} per ${sheetConfig.paperSize.toUpperCase()} sheet`
-                  : 'Exceeds sheet bounds'}
+                  ? `${sheetMetrics.cardsPerPage} per ${sheetConfig.paperSize.toUpperCase()}`
+                  : 'Exceeds sheet'}
               </span>
             </div>
           </div>
 
-          {/* Zoom Controls */}
-          <div className="flex items-center gap-1 shrink-0">
-            {[75, 100, 125, 150].map((level) => (
+          {/* Center-Right: Grid, Ruler Guides & Snap Controls */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white divide-x divide-[#E4E4E7]">
               <button
-                key={level}
                 type="button"
-                onClick={() => setZoomPct(level)}
-                className={`px-2 py-1 text-[11px] font-mono-tabular rounded transition-colors whitespace-nowrap ${
-                  zoomPct === level
-                    ? 'bg-[#18181B] text-white'
+                onClick={() => setShowGrid((prev) => !prev)}
+                aria-pressed={showGrid}
+                title="Toggle canvas grid overlay"
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors whitespace-nowrap rounded-l-md ${
+                  showGrid
+                    ? 'bg-[#EFF6FF] text-[#1D4ED8]'
                     : 'text-[#52525B] hover:bg-[#F4F4F5] hover:text-[#09090B]'
                 }`}
               >
-                {level}%
+                <Grid3X3 className="w-3.5 h-3.5" />
+                <span>Grid</span>
               </button>
-            ))}
+
+              <button
+                type="button"
+                onClick={() => setShowRulers((prev) => !prev)}
+                aria-pressed={showRulers}
+                title="Toggle rulers & draggable guides"
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors whitespace-nowrap ${
+                  showRulers
+                    ? 'bg-[#EFF6FF] text-[#1D4ED8]'
+                    : 'text-[#52525B] hover:bg-[#F4F4F5] hover:text-[#09090B]'
+                }`}
+              >
+                <Ruler className="w-3.5 h-3.5" />
+                <span>Rulers</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSnapToGrid((prev) => !prev)}
+                aria-pressed={snapToGrid}
+                title="Toggle snapping to grid and ruler guides (hold Alt while dragging to bypass)"
+                className={`inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors whitespace-nowrap rounded-r-md ${
+                  snapToGrid
+                    ? 'bg-[#EFF6FF] text-[#1D4ED8]'
+                    : 'text-[#52525B] hover:bg-[#F4F4F5] hover:text-[#09090B]'
+                }`}
+              >
+                <Magnet className="w-3.5 h-3.5" />
+                <span>Snap</span>
+              </button>
+            </div>
+
+            <select
+              aria-label="Grid spacing"
+              value={activeGridOptionMm}
+              onChange={(e) => setGridSpacingMm(Number(e.target.value))}
+              title="Grid spacing"
+              className="h-[26px] px-1.5 text-[11px] font-mono-tabular text-[#52525B] bg-white border border-[#E4E4E7] rounded-md focus:outline-none focus:border-[#2563EB] cursor-pointer"
+            >
+              {gridSpacingOptions.map((opt) => (
+                <option key={opt.label} value={opt.mm}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+
+            {guides.length > 0 && (
+              <button
+                type="button"
+                onClick={handleClearGuides}
+                title={`Remove all ${guides.length} ruler guide${guides.length === 1 ? '' : 's'}`}
+                className="px-2 py-1 text-[11px] font-medium text-[#52525B] hover:text-[#DC2626] hover:bg-[#FEF2F2] border border-[#E4E4E7] rounded-md transition-colors whitespace-nowrap"
+              >
+                Clear guides ({guides.length})
+              </button>
+            )}
+          </div>
+
+          {/* Right: Zoom Controls */}
+          <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white divide-x divide-[#E4E4E7] shrink-0">
+            <button
+              type="button"
+              onClick={() => setZoomClamped(zoomPct - 15)}
+              disabled={zoomPct <= 25}
+              title="Zoom out (Scroll down or Ctrl+-)"
+              aria-label="Zoom out"
+              className="px-1.5 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 transition-colors rounded-l-md"
+            >
+              <Minus className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoomClamped(100)}
+              title="Reset zoom to 100% (Ctrl+0) · Scroll over canvas to zoom"
+              className="min-w-[46px] px-2 py-1 text-[11px] font-mono-tabular text-[#09090B] hover:bg-[#F4F4F5] transition-colors whitespace-nowrap text-center"
+            >
+              {zoomPct}%
+            </button>
+            <button
+              type="button"
+              onClick={() => setZoomClamped(zoomPct + 15)}
+              disabled={zoomPct >= 300}
+              title="Zoom in (Scroll up or Ctrl++)"
+              aria-label="Zoom in"
+              className="px-1.5 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 transition-colors rounded-r-md"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
           </div>
         </div>
 
         {/* Drafting Field */}
         <div
+          ref={canvasViewportRef}
           onClick={() => setSelectedLayers([])}
           style={{
             backgroundImage: 'radial-gradient(#D4D4D8 1px, transparent 1px)',
             backgroundSize: '20px 20px',
           }}
-          className="flex-1 overflow-auto flex flex-col items-center justify-center p-10"
+          className="flex-1 overflow-auto flex p-10"
         >
-          <div className="shadow-[0_14px_40px_-14px_rgba(9,9,11,0.16)] ring-1 ring-black/6">
-            <CardPreview
-              design={design}
-              entry={activeEntry}
-              rowIndex={safeEntryIndex}
+          <div className="m-auto flex flex-col items-center">
+            <CanvasRulerFrame
+              widthMm={design.widthMm}
+              heightMm={design.heightMm}
               widthPx={renderedWidthPx}
-              interactive
-              selectedLayers={selectedLayers}
-              onSelectLayers={setSelectedLayers}
-              onUpdateDesign={onUpdateDesign}
-              onUpdateContentBlock={updateContentBlock}
-              onUpdateAssetLayer={updateAssetLayer}
-              onBeginDragTransaction={onBeginDesignTransaction}
-              onEndDragTransaction={onEndDesignTransaction}
-              showReferenceGhost
-            />
-          </div>
+              unit={design.unit}
+              showRulers={showRulers}
+              guides={guides}
+              snapToGrid={snapToGrid}
+              gridSpacingMm={activeGridOptionMm}
+              onAddGuide={handleAddGuide}
+              onUpdateGuide={handleUpdateGuide}
+              onRemoveGuide={handleRemoveGuide}
+            >
+              <CardPreview
+                design={design}
+                entry={activeEntry}
+                rowIndex={safeEntryIndex}
+                widthPx={renderedWidthPx}
+                interactive
+                selectedLayers={selectedLayers}
+                onSelectLayers={setSelectedLayers}
+                onUpdateDesign={onUpdateDesign}
+                onUpdateContentBlock={updateContentBlock}
+                onUpdateAssetLayer={updateAssetLayer}
+                onBeginDragTransaction={onBeginDesignTransaction}
+                onEndDragTransaction={onEndDesignTransaction}
+                showReferenceGhost
+                showGrid={showGrid}
+                gridSpacingMm={activeGridOptionMm}
+                snapToGrid={snapToGrid}
+                guides={guides}
+                showGuides={showRulers}
+                onUpdateGuide={handleUpdateGuide}
+                onRemoveGuide={handleRemoveGuide}
+              />
+            </CanvasRulerFrame>
 
-          <p className="mt-6 text-[11px] text-[#71717A] text-center">
-            Drag empty space or Shift+click to select multiple · Drag or use arrow keys to move · Ctrl+Z / Ctrl+Y to undo &amp; redo
-          </p>
+            <p className="mt-6 text-[11px] text-[#71717A] text-center whitespace-nowrap">
+              Scroll to zoom ·{' '}
+              {showRulers
+                ? 'Drag from rulers for guides (double-click to remove) · '
+                : ''}
+              {snapToGrid ? 'Hold Alt to bypass snap · ' : ''}
+              Shift+click or drag box to multi-select
+            </p>
+          </div>
         </div>
       </main>
 

@@ -5,9 +5,10 @@ import {
   ContentBlock,
   DesignUpdateOptions,
   EntryRow,
+  RulerGuide,
   SelectedLayerItem,
 } from '../types';
-import { resolveBlockText } from '../utils/cardRenderer';
+import { formatDimension, resolveBlockText } from '../utils/cardRenderer';
 
 interface CardPreviewProps {
   design: CardDesign;
@@ -34,6 +35,13 @@ interface CardPreviewProps {
   onBeginDragTransaction?: () => void;
   onEndDragTransaction?: (didChange: boolean) => void;
   showReferenceGhost?: boolean;
+  showGrid?: boolean;
+  gridSpacingMm?: number;
+  snapToGrid?: boolean;
+  guides?: RulerGuide[];
+  showGuides?: boolean;
+  onUpdateGuide?: (id: string, positionMm: number) => void;
+  onRemoveGuide?: (id: string) => void;
 }
 
 interface MarqueeBox {
@@ -43,12 +51,71 @@ interface MarqueeBox {
   currentY: number;
 }
 
+interface ActiveSnapLines {
+  xMm: number | null;
+  yMm: number | null;
+}
+
 function isLayerSelected(
   layers: SelectedLayerItem[],
   type: 'content' | 'asset',
   id: string
 ): boolean {
   return layers.some((l) => l.type === type && l.id === id);
+}
+
+function snapCoordinateMm(
+  candidateMm: number,
+  spanMm: number,
+  cardSpanMm: number,
+  guidesMm: number[],
+  gridSpacingMm: number
+): { snappedMm: number; snapLineMm: number | null } {
+  const guideThresholdMm = 1.8;
+
+  // 1. Check user ruler guides & card center (left/top edge, center, or right/bottom edge)
+  const targets = [...guidesMm, cardSpanMm / 2];
+  let bestDelta = Infinity;
+  let bestSnapped = candidateMm;
+  let bestLine: number | null = null;
+
+  for (const target of targets) {
+    // Leading edge
+    const dStart = Math.abs(candidateMm - target);
+    if (dStart < guideThresholdMm && dStart < bestDelta) {
+      bestDelta = dStart;
+      bestSnapped = target;
+      bestLine = target;
+    }
+    // Center of element/group
+    const center = candidateMm + spanMm / 2;
+    const dCenter = Math.abs(center - target);
+    if (dCenter < guideThresholdMm && dCenter < bestDelta) {
+      bestDelta = dCenter;
+      bestSnapped = target - spanMm / 2;
+      bestLine = target;
+    }
+    // Trailing edge
+    const end = candidateMm + spanMm;
+    const dEnd = Math.abs(end - target);
+    if (dEnd < guideThresholdMm && dEnd < bestDelta) {
+      bestDelta = dEnd;
+      bestSnapped = target - spanMm;
+      bestLine = target;
+    }
+  }
+
+  if (bestLine !== null) {
+    return { snappedMm: bestSnapped, snapLineMm: bestLine };
+  }
+
+  // 2. Snap to grid spacing
+  if (gridSpacingMm > 0) {
+    const snapped = Math.round(candidateMm / gridSpacingMm) * gridSpacingMm;
+    return { snappedMm: snapped, snapLineMm: null };
+  }
+
+  return { snappedMm: candidateMm, snapLineMm: null };
 }
 
 export function CardPreview({
@@ -65,18 +132,78 @@ export function CardPreview({
   onBeginDragTransaction,
   onEndDragTransaction,
   showReferenceGhost = false,
+  showGrid = false,
+  gridSpacingMm = 5,
+  snapToGrid = false,
+  guides = [],
+  showGuides = false,
+  onUpdateGuide,
+  onRemoveGuide,
 }: CardPreviewProps) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [marquee, setMarquee] = useState<MarqueeBox | null>(null);
+  const [activeSnapLines, setActiveSnapLines] = useState<ActiveSnapLines>({
+    xMm: null,
+    yMm: null,
+  });
+  const [draggingGuideId, setDraggingGuideId] = useState<string | null>(null);
   const suppressNextCardClickRef = useRef(false);
 
   const pxPerMm = widthPx / Math.max(10, design.widthMm);
   const heightPx = design.heightMm * pxPerMm;
   const ptToPx = (pt: number) => (pt * pxPerMm * 25.4) / 72;
 
+  const verticalGuidesMm = showGuides
+    ? guides.filter((g) => g.axis === 'x').map((g) => g.positionMm)
+    : [];
+  const horizontalGuidesMm = showGuides
+    ? guides.filter((g) => g.axis === 'y').map((g) => g.positionMm)
+    : [];
+
+  const startGuideDrag = (e: React.PointerEvent, guide: RulerGuide) => {
+    if (!interactive || !cardRef.current || e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const rect = cardRef.current.getBoundingClientRect();
+    const maxMm = guide.axis === 'x' ? design.widthMm : design.heightMm;
+    setDraggingGuideId(guide.id);
+
+    const onMove = (ev: PointerEvent) => {
+      const rawPx =
+        guide.axis === 'x' ? ev.clientX - rect.left : ev.clientY - rect.top;
+      const rawMm = rawPx / pxPerMm;
+
+      if (rawMm < -2 || rawMm > maxMm + 2) {
+        onRemoveGuide?.(guide.id);
+        setDraggingGuideId(null);
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        return;
+      }
+
+      const clamped = Math.max(0, Math.min(maxMm, rawMm));
+      let nextMm = Math.round(clamped * 2) / 2;
+      if (snapToGrid && gridSpacingMm > 0) {
+        const snapped = Math.round(clamped / gridSpacingMm) * gridSpacingMm;
+        if (Math.abs(snapped - clamped) <= Math.min(2, gridSpacingMm * 0.35)) {
+          nextMm = Math.round(snapped * 10) / 10;
+        }
+      }
+      onUpdateGuide?.(guide.id, nextMm);
+    };
+
+    const onUp = () => {
+      setDraggingGuideId(null);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
   const startMarqueeSelection = (e: React.PointerEvent) => {
     if (!interactive || !cardRef.current || e.button !== 0) return;
-    // Only start marquee when clicking directly on card background
     if (e.target !== e.currentTarget) return;
 
     e.preventDefault();
@@ -96,7 +223,9 @@ export function CardPreview({
       const bottom = Math.max(box.startY, box.currentY);
 
       const hits: SelectedLayerItem[] = [...baseSelection];
-      const nodes = cardRef.current?.querySelectorAll<HTMLElement>('[data-layer-type][data-layer-id]');
+      const nodes = cardRef.current?.querySelectorAll<HTMLElement>(
+        '[data-layer-type][data-layer-id]'
+      );
       if (!nodes) return hits;
 
       nodes.forEach((node) => {
@@ -218,35 +347,89 @@ export function CardPreview({
         }
       });
 
-      // Compute shared group clamp bounds so moving a group preserves relative offsets cleanly
       let minDx = -Infinity;
       let maxDx = Infinity;
       let minDy = -Infinity;
       let maxDy = Infinity;
+      let groupMinX = Infinity;
+      let groupMaxRight = -Infinity;
+      let groupMinY = Infinity;
+      let groupMaxBottom = -Infinity;
 
       initialBlocks.forEach((b) => {
         minDx = Math.max(minDx, -b.xPct);
         maxDx = Math.min(maxDx, 100 - b.widthPct - b.xPct);
         minDy = Math.max(minDy, -b.yPct);
         maxDy = Math.min(maxDy, 94 - b.yPct);
+        groupMinX = Math.min(groupMinX, b.xPct);
+        groupMaxRight = Math.max(groupMaxRight, b.xPct + b.widthPct);
+        groupMinY = Math.min(groupMinY, b.yPct);
+        groupMaxBottom = Math.max(groupMaxBottom, b.yPct + 10);
       });
       initialAssets.forEach((a) => {
         minDx = Math.max(minDx, -a.xPct);
         maxDx = Math.min(maxDx, 100 - a.widthPct - a.xPct);
         minDy = Math.max(minDy, -a.yPct);
         maxDy = Math.min(maxDy, 100 - a.heightPct - a.yPct);
+        groupMinX = Math.min(groupMinX, a.xPct);
+        groupMaxRight = Math.max(groupMaxRight, a.xPct + a.widthPct);
+        groupMinY = Math.min(groupMinY, a.yPct);
+        groupMaxBottom = Math.max(groupMaxBottom, a.yPct + a.heightPct);
       });
+
+      const groupWidthMm = ((groupMaxRight - groupMinX) / 100) * design.widthMm;
+      const groupHeightMm = ((groupMaxBottom - groupMinY) / 100) * design.heightMm;
 
       const onMove = (ev: PointerEvent) => {
         const rawDx = ((ev.clientX - startX) / rect.width) * 100;
         const rawDy = ((ev.clientY - startY) / rect.height) * 100;
 
-        const dxPct = Math.round(Math.max(minDx, Math.min(maxDx, rawDx)) * 2) / 2;
-        const dyPct = Math.round(Math.max(minDy, Math.min(maxDy, rawDy)) * 2) / 2;
+        let dxPct = Math.max(minDx, Math.min(maxDx, rawDx));
+        let dyPct = Math.max(minDy, Math.min(maxDy, rawDy));
+        let snapXLine: number | null = null;
+        let snapYLine: number | null = null;
 
-        if (Math.abs(dxPct) > 0 || Math.abs(dyPct) > 0) {
+        if (snapToGrid && !ev.altKey) {
+          const candidateLeftMm = ((groupMinX + dxPct) / 100) * design.widthMm;
+          const candidateTopMm = ((groupMinY + dyPct) / 100) * design.heightMm;
+
+          const snapX = snapCoordinateMm(
+            candidateLeftMm,
+            groupWidthMm,
+            design.widthMm,
+            verticalGuidesMm,
+            gridSpacingMm
+          );
+          const snapY = snapCoordinateMm(
+            candidateTopMm,
+            groupHeightMm,
+            design.heightMm,
+            horizontalGuidesMm,
+            gridSpacingMm
+          );
+
+          dxPct = Math.max(
+            minDx,
+            Math.min(maxDx, (snapX.snappedMm / design.widthMm) * 100 - groupMinX)
+          );
+          dyPct = Math.max(
+            minDy,
+            Math.min(maxDy, (snapY.snappedMm / design.heightMm) * 100 - groupMinY)
+          );
+          snapXLine = snapX.snapLineMm;
+          snapYLine = snapY.snapLineMm;
+        } else {
+          dxPct = Math.round(dxPct * 2) / 2;
+          dyPct = Math.round(dyPct * 2) / 2;
+        }
+
+        setActiveSnapLines({ xMm: snapXLine, yMm: snapYLine });
+
+        if (Math.abs(dxPct) > 0.01 || Math.abs(dyPct) > 0.01) {
           didChange = true;
         }
+
+        const roundPct = (v: number) => Math.round(v * 100) / 100;
 
         if (onUpdateDesign) {
           onUpdateDesign(
@@ -257,8 +440,8 @@ export function CardPreview({
                 if (!init) return b;
                 return {
                   ...b,
-                  xPct: Math.round((init.xPct + dxPct) * 2) / 2,
-                  yPct: Math.round((init.yPct + dyPct) * 2) / 2,
+                  xPct: roundPct(init.xPct + dxPct),
+                  yPct: roundPct(init.yPct + dyPct),
                 };
               }),
               assets: prev.assets.map((a) => {
@@ -266,8 +449,8 @@ export function CardPreview({
                 if (!init) return a;
                 return {
                   ...a,
-                  xPct: Math.round((init.xPct + dxPct) * 2) / 2,
-                  yPct: Math.round((init.yPct + dyPct) * 2) / 2,
+                  xPct: roundPct(init.xPct + dxPct),
+                  yPct: roundPct(init.yPct + dyPct),
                 };
               }),
             }),
@@ -278,7 +461,7 @@ export function CardPreview({
           if (init) {
             onUpdateContentBlock?.(
               id,
-              { xPct: init.xPct + dxPct, yPct: init.yPct + dyPct },
+              { xPct: roundPct(init.xPct + dxPct), yPct: roundPct(init.yPct + dyPct) },
               { skipHistory: true }
             );
           }
@@ -287,7 +470,7 @@ export function CardPreview({
           if (init) {
             onUpdateAssetLayer?.(
               id,
-              { xPct: init.xPct + dxPct, yPct: init.yPct + dyPct },
+              { xPct: roundPct(init.xPct + dxPct), yPct: roundPct(init.yPct + dyPct) },
               { skipHistory: true }
             );
           }
@@ -297,6 +480,7 @@ export function CardPreview({
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        setActiveSnapLines({ xMm: null, yMm: null });
         onEndDragTransaction?.(didChange);
       };
 
@@ -317,14 +501,33 @@ export function CardPreview({
 
       const onMove = (ev: PointerEvent) => {
         const dxPct = ((ev.clientX - startX) / rect.width) * 100;
-        const nextW = Math.max(10, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
-        if (nextW !== origW) didChange = true;
+        let nextW = Math.max(10, Math.min(100 - origX, origW + dxPct));
+
+        if (snapToGrid && !ev.altKey && gridSpacingMm > 0) {
+          const rightEdgeMm = ((origX + nextW) / 100) * design.widthMm;
+          const snapR = snapCoordinateMm(
+            rightEdgeMm,
+            0,
+            design.widthMm,
+            verticalGuidesMm,
+            gridSpacingMm
+          );
+          setActiveSnapLines({ xMm: snapR.snapLineMm, yMm: null });
+          const snappedW = (snapR.snappedMm / design.widthMm) * 100 - origX;
+          nextW = Math.max(10, Math.min(100 - origX, Math.round(snappedW * 100) / 100));
+        } else {
+          setActiveSnapLines({ xMm: null, yMm: null });
+          nextW = Math.round(nextW * 2) / 2;
+        }
+
+        if (Math.abs(nextW - origW) > 0.01) didChange = true;
         onUpdateContentBlock?.(id, { widthPct: nextW }, { skipHistory: true });
       };
 
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        setActiveSnapLines({ xMm: null, yMm: null });
         onEndDragTransaction?.(didChange);
       };
 
@@ -344,15 +547,49 @@ export function CardPreview({
       const onMove = (ev: PointerEvent) => {
         const dxPct = ((ev.clientX - startX) / rect.width) * 100;
         const dyPct = ((ev.clientY - startY) / rect.height) * 100;
-        const nextW = Math.max(4, Math.min(100 - origX, Math.round((origW + dxPct) * 2) / 2));
-        const nextH = Math.max(4, Math.min(100 - origY, Math.round((origH + dyPct) * 2) / 2));
-        if (nextW !== origW || nextH !== origH) didChange = true;
+        let nextW = Math.max(4, Math.min(100 - origX, origW + dxPct));
+        let nextH = Math.max(4, Math.min(100 - origY, origH + dyPct));
+
+        if (snapToGrid && !ev.altKey && gridSpacingMm > 0) {
+          const rightEdgeMm = ((origX + nextW) / 100) * design.widthMm;
+          const bottomEdgeMm = ((origY + nextH) / 100) * design.heightMm;
+          const snapR = snapCoordinateMm(
+            rightEdgeMm,
+            0,
+            design.widthMm,
+            verticalGuidesMm,
+            gridSpacingMm
+          );
+          const snapB = snapCoordinateMm(
+            bottomEdgeMm,
+            0,
+            design.heightMm,
+            horizontalGuidesMm,
+            gridSpacingMm
+          );
+          setActiveSnapLines({ xMm: snapR.snapLineMm, yMm: snapB.snapLineMm });
+          nextW = Math.max(
+            4,
+            Math.min(100 - origX, Math.round(((snapR.snappedMm / design.widthMm) * 100 - origX) * 100) / 100)
+          );
+          nextH = Math.max(
+            4,
+            Math.min(100 - origY, Math.round(((snapB.snappedMm / design.heightMm) * 100 - origY) * 100) / 100)
+          );
+        } else {
+          setActiveSnapLines({ xMm: null, yMm: null });
+          nextW = Math.round(nextW * 2) / 2;
+          nextH = Math.round(nextH * 2) / 2;
+        }
+
+        if (Math.abs(nextW - origW) > 0.01 || Math.abs(nextH - origH) > 0.01) didChange = true;
         onUpdateAssetLayer?.(id, { widthPct: nextW, heightPct: nextH }, { skipHistory: true });
       };
 
       const onUp = () => {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerup', onUp);
+        setActiveSnapLines({ xMm: null, yMm: null });
         onEndDragTransaction?.(didChange);
       };
 
@@ -366,6 +603,22 @@ export function CardPreview({
   const strokePx = Math.max(1, design.borderWidthMm * pxPerMm);
   const doubleGapPx = Math.max(strokePx * 2.2, 1.1 * pxPerMm);
   const isSingleSelected = selectedLayers.length === 1;
+
+  // Compute non-printing millimeter grid lines for SVG overlay
+  const gridXLines: Array<{ px: number; major: boolean }> = [];
+  const gridYLines: Array<{ px: number; major: boolean }> = [];
+  if (interactive && showGrid && gridSpacingMm > 0) {
+    let idx = 1;
+    for (let x = gridSpacingMm; x < design.widthMm - 0.05; x += gridSpacingMm) {
+      gridXLines.push({ px: x * pxPerMm, major: idx % 2 === 0 });
+      idx++;
+    }
+    idx = 1;
+    for (let y = gridSpacingMm; y < design.heightMm - 0.05; y += gridSpacingMm) {
+      gridYLines.push({ px: y * pxPerMm, major: idx % 2 === 0 });
+      idx++;
+    }
+  }
 
   return (
     <div
@@ -482,6 +735,38 @@ export function CardPreview({
         />
       )}
 
+      {/* Editor-Only Precision Grid Overlay */}
+      {interactive && showGrid && (
+        <svg
+          width={widthPx}
+          height={heightPx}
+          className="absolute inset-0 pointer-events-none z-20"
+        >
+          {gridXLines.map((line, i) => (
+            <line
+              key={`gx-${i}`}
+              x1={line.px}
+              y1={0}
+              x2={line.px}
+              y2={heightPx}
+              stroke={line.major ? 'rgba(37, 99, 235, 0.18)' : 'rgba(37, 99, 235, 0.09)'}
+              strokeWidth="1"
+            />
+          ))}
+          {gridYLines.map((line, i) => (
+            <line
+              key={`gy-${i}`}
+              x1={0}
+              y1={line.px}
+              x2={widthPx}
+              y2={line.px}
+              stroke={line.major ? 'rgba(37, 99, 235, 0.18)' : 'rgba(37, 99, 235, 0.09)'}
+              strokeWidth="1"
+            />
+          ))}
+        </svg>
+      )}
+
       {/* Uploaded Graphic Assets */}
       {design.assets.map((asset) => {
         const isSelected = interactive && isLayerSelected(selectedLayers, 'asset', asset.id);
@@ -588,6 +873,76 @@ export function CardPreview({
           </div>
         );
       })}
+
+      {/* Editor-Only Draggable Ruler Guides */}
+      {interactive &&
+        showGuides &&
+        guides.map((guide) => {
+          const isVertical = guide.axis === 'x';
+          const posPx = guide.positionMm * pxPerMm;
+          const isActive =
+            draggingGuideId === guide.id ||
+            (isVertical &&
+              activeSnapLines.xMm !== null &&
+              Math.abs(activeSnapLines.xMm - guide.positionMm) < 0.05) ||
+            (!isVertical &&
+              activeSnapLines.yMm !== null &&
+              Math.abs(activeSnapLines.yMm - guide.positionMm) < 0.05);
+
+          return (
+            <div
+              key={guide.id}
+              onPointerDown={(e) => startGuideDrag(e, guide)}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                onRemoveGuide?.(guide.id);
+              }}
+              title={`Drag to move · Double-click to remove (${formatDimension(guide.positionMm, design.unit)})`}
+              style={
+                isVertical
+                  ? { left: `${posPx - 3}px`, top: 0, bottom: 0, width: '7px' }
+                  : { top: `${posPx - 3}px`, left: 0, right: 0, height: '7px' }
+              }
+              className={`absolute z-35 group ${
+                isVertical ? 'cursor-ew-resize' : 'cursor-ns-resize'
+              }`}
+            >
+              <div
+                className={
+                  isVertical
+                    ? `mx-auto h-full w-px transition-colors ${
+                        isActive ? 'bg-[#2563EB]' : 'bg-[#3B82F6]/70 group-hover:bg-[#2563EB]'
+                      }`
+                    : `my-auto w-full h-px transition-colors ${
+                        isActive ? 'bg-[#2563EB]' : 'bg-[#3B82F6]/70 group-hover:bg-[#2563EB]'
+                      }`
+                }
+              />
+              {draggingGuideId === guide.id && (
+                <span
+                  style={isVertical ? { left: '8px', top: '6px' } : { left: '6px', top: '8px' }}
+                  className="absolute px-1.5 py-0.5 text-[10px] font-mono-tabular bg-[#18181B] text-white rounded whitespace-nowrap pointer-events-none"
+                >
+                  {formatDimension(guide.positionMm, design.unit)}
+                </span>
+              )}
+            </div>
+          );
+        })}
+
+      {/* Dynamic Center / Guide Snap Feedback Lines */}
+      {interactive && activeSnapLines.xMm !== null && (
+        <div
+          style={{ left: `${activeSnapLines.xMm * pxPerMm}px` }}
+          className="absolute top-0 bottom-0 w-px bg-[#2563EB] pointer-events-none z-40"
+        />
+      )}
+      {interactive && activeSnapLines.yMm !== null && (
+        <div
+          style={{ top: `${activeSnapLines.yMm * pxPerMm}px` }}
+          className="absolute left-0 right-0 h-px bg-[#2563EB] pointer-events-none z-40"
+        />
+      )}
 
       {/* Marquee Selection Rectangle */}
       {marquee &&

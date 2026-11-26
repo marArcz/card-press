@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { AlertTriangle, ChevronLeft, ChevronRight, Download, Loader2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, ChevronLeft, ChevronRight, Download, Loader2, Minus, Plus } from 'lucide-react';
 import { CardDesign, EntryRow, PrintSheetConfig } from '../types';
 import {
   computeSheetMetrics,
@@ -29,6 +29,64 @@ export function PrintSheetView({
   exportProgress,
 }: PrintSheetViewProps) {
   const [pageIndex, setPageIndex] = useState(0);
+  const [zoomPct, setZoomPct] = useState(100);
+  const sheetViewportRef = useRef<HTMLDivElement>(null);
+  const exactZoomRef = useRef<number>(100);
+
+  const setZoomClamped = useCallback((nextZoom: number) => {
+    const clamped = Math.min(250, Math.max(40, nextZoom));
+    exactZoomRef.current = clamped;
+    setZoomPct(Math.round(clamped));
+  }, []);
+
+  useEffect(() => {
+    const viewport = sheetViewportRef.current;
+    if (!viewport) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      if (e.shiftKey && !e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+
+      const normalizedDelta =
+        e.deltaMode === 1
+          ? e.deltaY * 16
+          : e.deltaMode === 2
+          ? e.deltaY * 400
+          : e.deltaY;
+
+      if (normalizedDelta === 0) return;
+
+      const sensitivity = e.ctrlKey || e.metaKey ? 0.008 : 0.0014;
+      const prevExact = exactZoomRef.current;
+      const nextExact = Math.min(250, Math.max(40, prevExact * Math.exp(-normalizedDelta * sensitivity)));
+      exactZoomRef.current = nextExact;
+
+      const prevRounded = Math.round(prevExact);
+      const nextRounded = Math.round(nextExact);
+      if (nextRounded === prevRounded) return;
+
+      const rect = viewport.getBoundingClientRect();
+      const pointerX = e.clientX - rect.left;
+      const pointerY = e.clientY - rect.top;
+      const contentX = viewport.scrollLeft + pointerX;
+      const contentY = viewport.scrollTop + pointerY;
+      const ratio = nextRounded / prevRounded;
+
+      setZoomPct(nextRounded);
+
+      requestAnimationFrame(() => {
+        if (viewport.scrollWidth > viewport.clientWidth) {
+          viewport.scrollLeft = contentX * ratio - pointerX;
+        }
+        if (viewport.scrollHeight > viewport.clientHeight) {
+          viewport.scrollTop = contentY * ratio - pointerY;
+        }
+      });
+    };
+
+    viewport.addEventListener('wheel', handleWheel, { passive: false });
+    return () => viewport.removeEventListener('wheel', handleWheel);
+  }, []);
 
   const selectedEntries = useMemo(
     () => getSelectedEntriesSlice(entries, sheetConfig),
@@ -49,13 +107,14 @@ export function PrintSheetView({
     return selectedEntries.slice(start, start + metrics.cardsPerPage);
   }, [metrics.fitsOnPage, metrics.cardsPerPage, safePageIndex, selectedEntries]);
 
-  // Scale sheet preview cleanly inside the desktop viewport
+  // Scale sheet preview cleanly inside the desktop viewport, multiplied by interactive zoom
   const maxPreviewWidth = sheetConfig.orientation === 'landscape' ? 760 : 540;
   const maxPreviewHeight = 680;
-  const scale = Math.min(
+  const baseScale = Math.min(
     maxPreviewWidth / metrics.pageWidthMm,
     maxPreviewHeight / metrics.pageHeightMm
   );
+  const scale = baseScale * (zoomPct / 100);
   const sheetWidthPx = Math.round(metrics.pageWidthMm * scale);
   const sheetHeightPx = Math.round(metrics.pageHeightMm * scale);
 
@@ -394,56 +453,90 @@ export function PrintSheetView({
             <span>300 DPI Print Output</span>
           </div>
 
-          <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white">
-            <button
-              type="button"
-              onClick={() => setPageIndex(Math.max(0, safePageIndex - 1))}
-              disabled={safePageIndex <= 0}
-              aria-label="Previous sheet"
-              className="p-1 text-[#52525B] hover:text-[#09090B] disabled:opacity-35"
-            >
-              <ChevronLeft className="w-3.5 h-3.5" />
-            </button>
-            <span className="px-2.5 text-[11px] font-mono-tabular text-[#09090B] whitespace-nowrap">
-              {metrics.totalPages > 0
-                ? `Sheet ${safePageIndex + 1} / ${metrics.totalPages}`
-                : 'Sheet 0 / 0'}
-            </span>
-            <button
-              type="button"
-              onClick={() => setPageIndex(Math.min(metrics.totalPages - 1, safePageIndex + 1))}
-              disabled={safePageIndex >= metrics.totalPages - 1}
-              aria-label="Next sheet"
-              className="p-1 text-[#52525B] hover:text-[#09090B] disabled:opacity-35"
-            >
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
+          <div className="flex items-center gap-2.5 shrink-0">
+            <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white">
+              <button
+                type="button"
+                onClick={() => setPageIndex(Math.max(0, safePageIndex - 1))}
+                disabled={safePageIndex <= 0}
+                aria-label="Previous sheet"
+                className="p-1 text-[#52525B] hover:text-[#09090B] disabled:opacity-35"
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <span className="px-2.5 text-[11px] font-mono-tabular text-[#09090B] whitespace-nowrap">
+                {metrics.totalPages > 0
+                  ? `Sheet ${safePageIndex + 1} / ${metrics.totalPages}`
+                  : 'Sheet 0 / 0'}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPageIndex(Math.min(metrics.totalPages - 1, safePageIndex + 1))}
+                disabled={safePageIndex >= metrics.totalPages - 1}
+                aria-label="Next sheet"
+                className="p-1 text-[#52525B] hover:text-[#09090B] disabled:opacity-35"
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="inline-flex items-center border border-[#E4E4E7] rounded-md bg-white divide-x divide-[#E4E4E7]">
+              <button
+                type="button"
+                onClick={() => setZoomClamped(zoomPct - 15)}
+                disabled={zoomPct <= 40}
+                title="Zoom out (Scroll down)"
+                aria-label="Zoom out"
+                className="px-1.5 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 transition-colors rounded-l-md"
+              >
+                <Minus className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setZoomClamped(100)}
+                title="Reset sheet zoom to 100% · Scroll over sheet to zoom"
+                className="min-w-[46px] px-2 py-1 text-[11px] font-mono-tabular text-[#09090B] hover:bg-[#F4F4F5] transition-colors whitespace-nowrap text-center"
+              >
+                {zoomPct}%
+              </button>
+              <button
+                type="button"
+                onClick={() => setZoomClamped(zoomPct + 15)}
+                disabled={zoomPct >= 250}
+                title="Zoom in (Scroll up)"
+                aria-label="Zoom in"
+                className="px-1.5 py-1 text-[#52525B] hover:text-[#09090B] hover:bg-[#F4F4F5] disabled:opacity-35 transition-colors rounded-r-md"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
         </div>
 
-        <div className="flex-1 overflow-auto flex items-center justify-center p-8">
-          {!metrics.fitsOnPage ? (
-            <div className="max-w-sm text-center p-6 bg-white border border-[#E4E4E7] rounded-lg">
-              <p className="text-sm font-medium text-[#09090B]">Card exceeds printable paper area</p>
-              <p className="text-xs text-[#71717A] mt-1">
-                Try switching the sheet to Landscape orientation or lowering page margins in the left panel.
-              </p>
-            </div>
-          ) : selectedEntries.length === 0 ? (
-            <div className="max-w-sm text-center p-6 bg-white border border-[#E4E4E7] rounded-lg">
-              <p className="text-sm font-medium text-[#09090B]">No entries selected for print</p>
-              <p className="text-xs text-[#71717A] mt-1">
-                Import an Excel spreadsheet or add entries in the Data tab to preview print sheets.
-              </p>
-            </div>
-          ) : (
-            <div
-              style={{
-                width: `${sheetWidthPx}px`,
-                height: `${sheetHeightPx}px`,
-              }}
-              className="relative bg-white shadow-[0_14px_40px_-14px_rgba(9,9,11,0.16)] ring-1 ring-black/8 shrink-0"
-            >
+        <div ref={sheetViewportRef} className="flex-1 overflow-auto flex p-8">
+          <div className="m-auto">
+            {!metrics.fitsOnPage ? (
+              <div className="max-w-sm text-center p-6 bg-white border border-[#E4E4E7] rounded-lg">
+                <p className="text-sm font-medium text-[#09090B]">Card exceeds printable paper area</p>
+                <p className="text-xs text-[#71717A] mt-1">
+                  Try switching the sheet to Landscape orientation or lowering page margins in the left panel.
+                </p>
+              </div>
+            ) : selectedEntries.length === 0 ? (
+              <div className="max-w-sm text-center p-6 bg-white border border-[#E4E4E7] rounded-lg">
+                <p className="text-sm font-medium text-[#09090B]">No entries selected for print</p>
+                <p className="text-xs text-[#71717A] mt-1">
+                  Import an Excel spreadsheet or add entries in the Data tab to preview print sheets.
+                </p>
+              </div>
+            ) : (
+              <div
+                style={{
+                  width: `${sheetWidthPx}px`,
+                  height: `${sheetHeightPx}px`,
+                }}
+                className="relative bg-white shadow-[0_14px_40px_-14px_rgba(9,9,11,0.16)] ring-1 ring-black/8 shrink-0"
+              >
               {/* Subtle Margin Guide */}
               <div
                 style={{
@@ -561,8 +654,9 @@ export function PrintSheetView({
                   })}
                 </svg>
               )}
-            </div>
-          )}
+              </div>
+            )}
+          </div>
         </div>
       </main>
     </div>

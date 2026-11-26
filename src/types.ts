@@ -162,6 +162,12 @@ export interface DesignUpdateOptions {
   coalesceKey?: string;
 }
 
+export interface RulerGuide {
+  id: string;
+  axis: 'x' | 'y';
+  positionMm: number;
+}
+
 export interface CardSizePreset {
   id: string;
   name: string;
